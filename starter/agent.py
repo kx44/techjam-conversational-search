@@ -170,22 +170,27 @@ class Agent:
         leaf = candidate.rsplit(" ", 1)[-1]
         return self._leaf_buckets.get(leaf)
 
-    def _parse_constraints(self, user_message: str) -> tuple[list[str], bool]:
-        """Return (constraints, resets) for one customer turn."""
+    def _parse_constraints(self, user_message: str) -> list[str]:
+        """Extract the constraint text disclosed by one customer turn.
+
+        An override revokes the tail of the opening message, which carries no
+        parseable prefix and so was never accumulated; everything already
+        collected came from explicit reveals and stays valid.
+        """
         if OVERRIDE_MARKER in user_message:
             if OVERRIDE_PREFIX in user_message:
                 value = user_message.split(OVERRIDE_PREFIX, 1)[1].rstrip(".").strip()
-                return ([value] if value else []), True
-            return [], True
+                return [value] if value else []
+            return []
         if REFUSAL_MARKER in user_message:
-            return [], False
+            return []
         if REQUIREMENT_PREFIX in user_message:
             value = user_message.split(REQUIREMENT_PREFIX, 1)[1].rstrip(".").strip()
-            return ([value] if value else []), False
+            return [value] if value else []
         if REVEAL_PREFIX in user_message:
             body = user_message.split(REVEAL_PREFIX, 1)[1].rstrip(".")
-            return [part.strip() for part in body.split("; ") if part.strip()], False
-        return [], False
+            return [part.strip() for part in body.split("; ") if part.strip()]
+        return []
 
     def _rank(self, candidates: list[str], constraints: list[str], top_k: int) -> list[str]:
         if not constraints:
@@ -225,10 +230,7 @@ class Agent:
             raise RuntimeError("reset must be called before respond")
         if state["candidates"] is None:
             state["candidates"] = self._resolve_bucket(user_message)
-        constraints, resets = self._parse_constraints(user_message)
-        if resets:
-            state["constraints"] = []
-        for value in constraints:
+        for value in self._parse_constraints(user_message):
             lowered = value.lower()
             if lowered not in state["constraints"]:
                 state["constraints"].append(lowered)
