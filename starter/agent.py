@@ -49,7 +49,16 @@ DIGITS = re.compile(r"\d")
 # missing artifact must degrade quietly rather than score zero.
 MODEL_DIR = "models/bge-small-en-v1.5"
 EMBEDDINGS = "data/bge_embeddings"
-USE_DENSE = True
+# Dense product retrieval is off. The embedding model is still loaded - decline
+# detection needs it - but its catalog matrix is not, and the ranking does not
+# take part in fusion. Measured on both harnesses:
+#   model + catalog matrix + prototypes   0.8760 / 0.9263
+#   model + prototypes only               0.8802 / 0.9298   <- shipped
+#   no model at all                       0.8598 / 0.9297
+# Dense retrieval was worth +0.004 before reranking existed and -0.004 after,
+# because the reranker absorbed what it contributed. Dropping the matrix also
+# drops 73 MB and an 18-minute precompute. Set True to re-check.
+USE_DENSE = False
 QUERY_INSTRUCTION = True    # BGE v1.5 recommends an instruction on queries only
 # Dense retrieval adds recall and costs precision: at equal weight it raises
 # hit rate but pushes the exact match down the list, because embeddings find
@@ -187,23 +196,33 @@ class Agent:
         self._intent = None
         self._intents: dict[str, bool] = {}
         self._build_index()
-        if USE_DENSE:
-            self._load_dense()
+        self._load_model()
 
-    def _load_dense(self) -> None:
-        """Attach dense retrieval when its artifacts are present."""
+    def _load_model(self) -> None:
+        """Attach whichever model-backed parts have their artifacts present.
+
+        The two consumers need different files and are loaded independently:
+        product retrieval needs the 73 MB catalog matrix, decline detection
+        needs only the 56 KB prototypes. Coupling them cost the detector
+        whenever the matrix was absent, which is the cheaper artifact to skip.
+        """
         try:
-            from starter.dense import DenseIndex, Encoder
+            from starter.dense import Encoder
 
-            index = DenseIndex.load(EMBEDDINGS)
-            if index.meta.get("count") not in (None, len(index.ids)):
-                raise ValueError("embedding metadata does not match the id list")
             self._encoder = Encoder(MODEL_DIR)
-            self._index = index
         except Exception:
             self._encoder = None
-            self._index = None
             return
+        if USE_DENSE:
+            try:
+                from starter.dense import DenseIndex
+
+                index = DenseIndex.load(EMBEDDINGS)
+                if index.meta.get("count") not in (None, len(index.ids)):
+                    raise ValueError("embedding metadata does not match the id list")
+                self._index = index
+            except Exception:
+                self._index = None
         try:
             from starter.intent import IntentDetector
 
@@ -458,7 +477,8 @@ class Agent:
         rankings = [
             (self._search("products", plain, RETRIEVE), 1.0),
             (stemmed_ranking, 1.0),
-            (self._dense_ranking(" ".join(state["text"]), DENSE_LIMIT), DENSE_WEIGHT),
+            (self._dense_ranking(" ".join(state["text"]), DENSE_LIMIT) if USE_DENSE else [],
+             DENSE_WEIGHT),
         ]
         if USE_EXPANSION:
             rankings.append((self._search(
