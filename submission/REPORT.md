@@ -71,10 +71,13 @@ By scenario:
 | reported token usage | 0 prompt, 0 completion |
 | estimated model cost | **$0.00** |
 | median latency | 43 ms/turn (p95 92 ms), 131 ms/session |
-| index build | 18.1 s |
-| peak RSS | 829 MB |
+| index build | 18.2 s, of which 17.7 s is the two FTS5 indexes |
+| query encoding | 2 ms/turn |
+| agent memory | 301 MB BM25-only, 567 MB with dense retrieval |
 
-The embedding model is used for retrieval only. It runs under `onnxruntime` on
+The embedding model costs memory, not time: it adds 0.5 s to start-up and 2 ms
+per turn, against 266 MB of resident memory and 201 MB on disk. It is used for
+retrieval only. It runs under `onnxruntime` on
 CPU with no PyTorch dependency; the exported graph returns `last_hidden_state`,
 so CLS pooling and L2 normalisation are done explicitly (BGE pools CLS, not
 mean — mean pooling this model produces plausible-looking vectors that rank
