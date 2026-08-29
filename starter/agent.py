@@ -21,8 +21,17 @@ RRF_K = 60          # standard Reciprocal Rank Fusion constant
 FEEDBACK_DOCS = 10  # RM3: documents assumed relevant
 EXPANSION_TERMS = 10
 MIN_FEEDBACK_DOCS = 6   # an expansion term must recur, or the query drifts
-RETRIEVE = 100
+# Retrieval depth. A fixed 100 discards the target far more often than the
+# full-conversation numbers suggest: at turn 1, BM25 recall@100 is only 52%,
+# and in 93 of 200 sessions the target sits beyond rank 100 (median rank 279)
+# scoring just 0.18 of the score spread below rank 100 - cut by a hair, not a
+# cliff. Depth matters because fusion needs the target *present* to collect
+# votes from more than one retriever; RRF already discounts deep ranks, so the
+# tail is nearly free. Measured official/realistic: 100 -> .7022/.7857,
+# 200 -> .7035/.7877, 500 -> .7081/.7916, 1000 -> .7079/.7916 (plateau).
+RETRIEVE = 500
 DIGITS = re.compile(r"\d")
+
 
 # Dense retrieval. Optional by construction: if the model, the precomputed
 # matrix, or the runtime dependencies are missing the agent falls back to BM25
@@ -40,6 +49,7 @@ QUERY_INSTRUCTION = True    # BGE v1.5 recommends an instruction on queries only
 # 1.00 -> .6897/.7690. Anything in 0.15-0.50 is within noise of the others; the
 # midpoint is taken rather than the argmax.
 DENSE_WEIGHT = 0.25
+DENSE_LIMIT = RETRIEVE
 
 # RM3 is implemented but off. Pseudo-relevance feedback assumes the first-pass
 # top-k is mostly relevant; this baseline's hit rate is 0.125, so the feedback
@@ -229,7 +239,13 @@ class Agent:
 
     @staticmethod
     def _fuse(rankings: list[tuple[list[str], float]], top_k: int) -> list[str]:
-        """Reciprocal Rank Fusion - combines rankings using order alone."""
+        """Reciprocal Rank Fusion - combines rankings using order alone.
+
+        Score-magnitude fusion (CombSUM over min-max normalised scores) was
+        measured and is worse: .7019/.7803 against .7081/.7916 at the same
+        depth. Rank order is the more robust signal across retrievers whose
+        scores are on incomparable scales.
+        """
         scores: dict[str, float] = {}
         for ranking, weight in rankings:
             for rank, pid in enumerate(ranking):
@@ -305,7 +321,7 @@ class Agent:
         rankings = [
             (self._search("products", plain, RETRIEVE), 1.0),
             (stemmed_ranking, 1.0),
-            (self._dense_ranking(" ".join(state["text"]), RETRIEVE), DENSE_WEIGHT),
+            (self._dense_ranking(" ".join(state["text"]), DENSE_LIMIT), DENSE_WEIGHT),
         ]
         if USE_EXPANSION:
             rankings.append((self._search(
