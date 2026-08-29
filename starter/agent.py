@@ -69,7 +69,7 @@ class Agent:
     def __init__(self, catalog_path: str | Path = "data/catalog.jsonl") -> None:
         self.catalog_path = Path(catalog_path)
         self.connection = sqlite3.connect(":memory:")
-        self._sessions: set[str] = set()
+        self._sessions: dict[str, dict] = {}
         self._doc: dict[str, str] = {}   # stemmed content tokens, for RM3 feedback
         self._df: dict[str, int] = {}
         self._cache: dict[tuple, list[str]] = {}
@@ -172,7 +172,27 @@ class Agent:
 
     def reset(self, session_id: str, user_profile: dict) -> None:
         # The profile is anonymized and may be used for personalization.
-        self._sessions.add(session_id)
+        self._sessions[session_id] = {"seen": set(), "plain": {}, "stems": {}}
+
+    @staticmethod
+    def _accumulate(state: dict, message: str) -> None:
+        """Fold one customer turn into the running query.
+
+        A message identical to one already seen carries no new information, so
+        it is ignored - otherwise repeated boilerplate accrues weight and
+        crowds out the terms that actually distinguish the target.
+        """
+        if message in state["seen"]:
+            return
+        state["seen"].add(message)
+        for term in _terms(message):
+            state["plain"][term] = state["plain"].get(term, 0) + 1
+        for term in _stemmed(message):
+            state["stems"][term] = state["stems"].get(term, 0) + 1
+
+    @staticmethod
+    def _query(counts: dict[str, int]) -> list[str]:
+        return sorted(counts, key=lambda term: (-counts[term], term))
 
     def respond(
         self,
@@ -181,19 +201,20 @@ class Agent:
         turn: int,
         top_k: int,
     ) -> dict:
-        if session_id not in self._sessions:
+        state = self._sessions.get(session_id)
+        if state is None:
             raise RuntimeError("reset must be called before respond")
-        key = (user_message, top_k)
-        if key in self._cache:                     # stateless: same text, same answer
-            ranked = self._cache[key]
+        self._accumulate(state, user_message)
+        plain = self._query(state["plain"])
+        stems = self._query(state["stems"])
+        key = (tuple(plain), top_k)
+        if key in self._cache:                     # same evidence, same answer
             return {
                 "message": "Here are the closest matches I found.",
                 "ask_attribute": None,
-                "recommendations": [{"parent_asin": pid} for pid in ranked],
+                "recommendations": [{"parent_asin": pid} for pid in self._cache[key]],
                 "usage": {"prompt_tokens": 0, "completion_tokens": 0},
             }
-        plain = _terms(user_message)
-        stems = _stemmed(user_message)
         rankings = [
             self._search("products", plain, RETRIEVE),
             self._search("products_stem", stems, RETRIEVE),
