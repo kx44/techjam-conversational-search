@@ -8,13 +8,16 @@ network, no credentials, no reported token usage. Median 38 ms per turn.
 ```
 customer message
   │
-  ├─ ACCUMULATE   skip if identical to an earlier turn; add terms to the
-  │               running query; keep the raw sentences for the dense side
+  ├─ CLASSIFY     did the customer answer the question, or decline it?
+  │               each clause embedded and matched to prototype sentences
   │
-  ├─ RETRIEVE     three views of one catalog, 500 candidates each
+  ├─ ACCUMULATE   skip if identical to an earlier turn; add terms to the
+  │               running query
+  │
+  ├─ RETRIEVE     two views of one catalog, 500 candidates each
   │                 BM25 over raw tokens                weight 1.00
   │                 BM25 over Porter-stemmed tokens     weight 1.00
-  │                 BGE-small cosine over 384-d vectors weight 0.25
+  │                 (dense product retrieval available, off - see Models)
   │
   ├─ FUSE         weighted Reciprocal Rank Fusion (k=60) -> top 50
   │
@@ -24,8 +27,10 @@ customer message
   │                 price       0.3   fit against a stated budget
   │
   └─ RESPOND      top 10, plus one clarifying question
-                  (broad first: feature, use_case, style, then material,
-                   colour, size, budget; an attribute yielding nothing is retired)
+                  broad first: feature, use_case, style, then material,
+                  colour, size, budget. Asking an attribute suppresses it,
+                  declining suppresses it harder, and suppression decays each
+                  turn - so a declined question returns to contention later.
 ```
 
 Two design choices carry most of the result. **Conversation accumulation** — the
