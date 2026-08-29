@@ -39,6 +39,10 @@ DIGITS = re.compile(r"\d")
 # missing artifact must degrade quietly rather than score zero.
 MODEL_DIR = "models/bge-small-en-v1.5"
 EMBEDDINGS = "data/bge_embeddings"
+PROTOTYPES = "data/intent_prototypes"
+# An override demotes earlier evidence rather than clearing it: a customer
+# correcting themselves usually still means most of what they already said.
+OVERRIDE_DECAY = 0.25
 USE_DENSE = True
 QUERY_INSTRUCTION = True    # BGE v1.5 recommends an instruction on queries only
 # Dense retrieval adds recall and costs precision: at equal weight it raises
@@ -122,6 +126,8 @@ class Agent:
         self._vectors: dict[str, object] = {}
         self._encoder = None
         self._index = None
+        self._intent = None
+        self._intents: dict[str, tuple[str, float]] = {}
         self._build_index()
         if USE_DENSE:
             self._load_dense()
@@ -139,6 +145,31 @@ class Agent:
         except Exception:
             self._encoder = None
             self._index = None
+            return
+        try:
+            from starter.intent import IntentDetector
+
+            self._intent = IntentDetector.load(PROTOTYPES)
+        except Exception:
+            try:
+                from starter.intent import IntentDetector
+
+                self._intent = IntentDetector.build(self._encoder)
+            except Exception:
+                self._intent = None
+
+    def _classify(self, message: str) -> tuple[str, float]:
+        """Intent of one customer turn. Cached: the same turn text recurs often."""
+        if self._intent is None or self._encoder is None:
+            return "UNKNOWN", 0.0
+        cached = self._intents.get(message)
+        if cached is None:
+            try:
+                cached = self._intent.classify_message(message, self._encoder)
+            except Exception:
+                cached = ("UNKNOWN", 0.0)
+            self._intents[message] = cached
+        return cached
 
     def _dense_ranking(self, text: str, limit: int) -> list[str]:
         if self._encoder is None or self._index is None or not text.strip():
@@ -258,11 +289,10 @@ class Agent:
         self._sessions[session_id] = {
             "seen": set(), "plain": {}, "stems": {},
             "asked": set(), "retired": set(), "last_ask": None, "size": 0,
-            "text": [],
+            "text": [], "values": {},
         }
 
-    @staticmethod
-    def _accumulate(state: dict, message: str) -> None:
+    def _accumulate(self, state: dict, message: str) -> None:
         """Fold one customer turn into the running query.
 
         A message identical to one already seen carries no new information, so
@@ -272,16 +302,40 @@ class Agent:
         if message in state["seen"]:
             return
         state["seen"].add(message)
+        self._apply_intent(state, message)
         # Dense retrieval reads the sentences as written; only the lexical side
         # wants a bag of terms.
         state["text"].append(message)
         for term in _terms(message):
-            state["plain"][term] = state["plain"].get(term, 0) + 1
+            state["plain"][term] = state["plain"].get(term, 0.0) + 1.0
         for term in _stemmed(message):
-            state["stems"][term] = state["stems"].get(term, 0) + 1
+            state["stems"][term] = state["stems"].get(term, 0.0) + 1.0
+
+    def _apply_intent(self, state: dict, message: str) -> None:
+        """Let the intent of a turn adjust accumulated state before folding it in."""
+        from starter.intent import NO_PREFERENCE, OVERRIDE, extract_values
+
+        intent, _ = self._classify(message)
+        values = extract_values(message)
+        # A stated value that contradicts one already on record is a correction
+        # whether or not the customer used a word like "actually".
+        conflict = any(
+            attribute in state["values"] and state["values"][attribute] != value
+            for attribute, value in values.items()
+        )
+        if intent == OVERRIDE or conflict:
+            for term in state["plain"]:
+                state["plain"][term] *= OVERRIDE_DECAY
+            for term in state["stems"]:
+                state["stems"][term] *= OVERRIDE_DECAY
+            state["values"] = {}
+        elif intent == NO_PREFERENCE and state["last_ask"]:
+            # The customer has no view on what we just asked; treat it as ANY.
+            state["retired"].add(state["last_ask"])
+        state["values"].update(values)
 
     @staticmethod
-    def _query(counts: dict[str, int]) -> list[str]:
+    def _query(counts: dict[str, float]) -> list[str]:
         return sorted(counts, key=lambda term: (-counts[term], term))
 
     def _choose(self, state: dict) -> str:
