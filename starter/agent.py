@@ -16,6 +16,16 @@ STOPWORDS = {
     "that", "the", "this", "to", "want", "with", "would", "you", "looking",
 }
 
+# Per-column BM25 weights, positional against the CREATE VIRTUAL TABLE order
+# (the UNINDEXED id takes slot 1): title, categories, features, details, store,
+# description. Inherited from the starter kit and swept rather than trusted -
+# ten configurations span only 0.026, and flat 1.0 across every field loses
+# just 0.022, so the weighting barely matters now that reranking decides order
+# and BM25 only has to supply recall. Boosting features and details, where the
+# constraint text the customer quotes actually lives, is worse (0.8602 and
+# 0.8534 against 0.8638); raising categories looks better at 0.8670 but the
+# curve is non-monotone - 6.0 scores below both 4.0 and 8.0 - so that is one
+# session of noise, not signal. Left as found.
 BM25_WEIGHTS = "0.0, 6.0, 4.0, 2.5, 2.5, 1.5, 1.0"
 RRF_K = 60          # standard Reciprocal Rank Fusion constant
 FEEDBACK_DOCS = 10  # RM3: documents assumed relevant
