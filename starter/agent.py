@@ -67,11 +67,20 @@ RERANK_WEIGHTS = {
 # Four other features were measured and dropped. Carrying the fusion score in
 # as a prior was the worst (0.7708 -> 0.8135 without it): RRF's ordering is
 # exactly what the reranker exists to correct, so anchoring to it re-imports
-# the flaw. Term coverage and title-match both helped filler - an accumulated
-# query is full of "what", "matters", "preference", and those match plenty of
-# product text - together costing 0.8135 -> 0.8625. Bigram phrases are immune,
-# because "what matters" appears in no catalog entry. Average rating did
-# nothing either way.
+# the flaw. Term coverage and title-match cost 0.8135 -> 0.8625 between them.
+# Average rating did nothing either way, in linear or banded form.
+#
+# Term coverage in particular has been retried and stays dead. It is not a
+# stopword problem: expanding the 31-word list to 171 conversational words
+# moved the total by +0.001 official and -0.007 natural language, and coverage
+# still hurt at every weight under every list. It is not a length-bias problem
+# either, though the bias is real - coverage correlates +0.41 with product text
+# length where phrase correlates -0.09 - because normalising the length out
+# makes it worse still (0.8532 raw -> 0.8040 BM25-normalised), the bias having
+# been an accidental stand-in for popularity. Coverage asks how many of the
+# customer's words appear somewhere in a product, and inside a pool of fifty
+# already-relevant candidates that is close to saturated. Adjacent pairs stay
+# discriminative because matching one by chance is rare.
 PRICE_HINT = re.compile(r"\$\s*(\d+(?:\.\d+)?)|\b(?:under|below|around|about|up to)\s+(\d+(?:\.\d+)?)", re.I)
 
 # RM3 is implemented but off. Pseudo-relevance feedback assumes the first-pass
