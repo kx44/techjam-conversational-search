@@ -24,6 +24,15 @@ MIN_FEEDBACK_DOCS = 6   # an expansion term must recur, or the query drifts
 RETRIEVE = 100
 DIGITS = re.compile(r"\d")
 
+# Dense retrieval. Optional by construction: if the model, the precomputed
+# matrix, or the runtime dependencies are missing the agent falls back to BM25
+# alone. The evaluator turns an agent exception into an empty response, so a
+# missing artifact must degrade quietly rather than score zero.
+MODEL_DIR = "models/bge-small-en-v1.5"
+EMBEDDINGS = "data/bge_embeddings"
+USE_DENSE = True
+QUERY_INSTRUCTION = True    # BGE v1.5 recommends an instruction on queries only
+
 # RM3 is implemented but off. Pseudo-relevance feedback assumes the first-pass
 # top-k is mostly relevant; this baseline's hit rate is 0.125, so the feedback
 # set is mostly wrong products and expansion amplifies the error. Measured:
@@ -92,7 +101,38 @@ class Agent:
         self._doc: dict[str, str] = {}   # stemmed content tokens, for RM3 feedback
         self._df: dict[str, int] = {}
         self._cache: dict[tuple, list[str]] = {}
+        self._vectors: dict[str, object] = {}
+        self._encoder = None
+        self._index = None
         self._build_index()
+        if USE_DENSE:
+            self._load_dense()
+
+    def _load_dense(self) -> None:
+        """Attach dense retrieval when its artifacts are present."""
+        try:
+            from starter.dense import DenseIndex, Encoder
+
+            index = DenseIndex.load(EMBEDDINGS)
+            if index.meta.get("count") not in (None, len(index.ids)):
+                raise ValueError("embedding metadata does not match the id list")
+            self._encoder = Encoder(MODEL_DIR)
+            self._index = index
+        except Exception:
+            self._encoder = None
+            self._index = None
+
+    def _dense_ranking(self, text: str, limit: int) -> list[str]:
+        if self._encoder is None or self._index is None or not text.strip():
+            return []
+        try:
+            vector = self._vectors.get(text)
+            if vector is None:
+                vector = self._encoder.encode_query(text, prefix=QUERY_INSTRUCTION)
+                self._vectors[text] = vector
+            return self._index.search(vector, limit)
+        except Exception:
+            return []
 
     def _build_index(self) -> None:
         cursor = self.connection.cursor()
@@ -194,6 +234,7 @@ class Agent:
         self._sessions[session_id] = {
             "seen": set(), "plain": {}, "stems": {},
             "asked": set(), "retired": set(), "last_ask": None, "size": 0,
+            "text": [],
         }
 
     @staticmethod
@@ -207,6 +248,9 @@ class Agent:
         if message in state["seen"]:
             return
         state["seen"].add(message)
+        # Dense retrieval reads the sentences as written; only the lexical side
+        # wants a bag of terms.
+        state["text"].append(message)
         for term in _terms(message):
             state["plain"][term] = state["plain"].get(term, 0) + 1
         for term in _stemmed(message):
@@ -253,6 +297,9 @@ class Agent:
             self._search("products", plain, RETRIEVE),
             self._search("products_stem", stems, RETRIEVE),
         ]
+        dense = self._dense_ranking(" ".join(state["text"]), RETRIEVE)
+        if dense:
+            rankings.append(dense)
         if USE_EXPANSION:
             rankings.append(self._search(
                 "products_stem",
