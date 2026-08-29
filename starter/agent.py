@@ -107,6 +107,24 @@ USE_EXPANSION = False
 # narrow-first 0.6772 / 0.7690.
 ATTRIBUTE_ORDER = ("feature", "use_case", "style", "material", "color",
                    "size", "budget", "brand", "category")
+
+# A declined question is not an answered one. The reference customer may decline
+# for reasons unrelated to preference - a Boundary session refuses the first
+# attribute asked, whatever it is - and treating that as settled retires the
+# question permanently. In one measured session that consumed "feature", which
+# was the only attribute unlocking three of its four constraints.
+#
+# Asking an attribute suppresses it; declining suppresses it harder. Suppression
+# decays each turn, so a declined attribute drifts back into contention later
+# rather than being re-asked at once. Re-asking immediately costs a turn and
+# cancels the gain; deferring it does not - MTTC improves, 2.98 -> 2.91.
+# Measured over decay 0.45-0.70 and fresh cost 0.15-0.50: every setting in
+# 0.45-0.60 x 0.2-0.3 beats the previous behaviour, so this is a plateau rather
+# than a tuned point, and the midpoint is taken.
+PROTOTYPES = "data/intent_prototypes"
+ATTRIBUTE_DECAY = 0.55
+FRESH_COST = 0.25
+DECLINE_PENALTY = 3.0
 QUESTIONS = {
     "material": "What material would you prefer?",
     "color": "Any particular colour you have in mind?",
@@ -166,6 +184,8 @@ class Agent:
         self._vectors: dict[str, object] = {}
         self._encoder = None
         self._index = None
+        self._intent = None
+        self._intents: dict[str, bool] = {}
         self._build_index()
         if USE_DENSE:
             self._load_dense()
@@ -183,6 +203,33 @@ class Agent:
         except Exception:
             self._encoder = None
             self._index = None
+            return
+        try:
+            from starter.intent import IntentDetector
+
+            self._intent = IntentDetector.load(PROTOTYPES)
+        except Exception:
+            self._intent = None
+
+    def _declined(self, message: str) -> bool:
+        """Did the customer decline the question rather than answer it?
+
+        Catalog statistics cannot tell a decline from a reveal - the rarest new
+        term has median IDF 1.34 against 1.15 - so this needs the embedding
+        detector, and is simply unavailable without it.
+        """
+        if self._intent is None or self._encoder is None:
+            return False
+        cached = self._intents.get(message)
+        if cached is None:
+            from starter.intent import NO_PREFERENCE
+
+            try:
+                cached = self._intent.classify_message(message, self._encoder)[0] == NO_PREFERENCE
+            except Exception:
+                cached = False
+            self._intents[message] = cached
+        return cached
 
     def _dense_ranking(self, text: str, limit: int) -> list[str]:
         if self._encoder is None or self._index is None or not text.strip():
@@ -329,11 +376,10 @@ class Agent:
         self._sessions[session_id] = {
             "seen": set(), "plain": {}, "stems": {},
             "asked": set(), "retired": set(), "last_ask": None, "size": 0,
-            "text": [], "budget": None,
+            "text": [], "budget": None, "suppress": {},
         }
 
-    @staticmethod
-    def _accumulate(state: dict, message: str) -> None:
+    def _accumulate(self, state: dict, message: str) -> None:
         """Fold one customer turn into the running query.
 
         A message identical to one already seen carries no new information, so
@@ -343,6 +389,15 @@ class Agent:
         if message in state["seen"]:
             return
         state["seen"].add(message)
+        if self._intent is not None:
+            suppress = state["suppress"]
+            for attribute in suppress:
+                suppress[attribute] *= ATTRIBUTE_DECAY
+            if state["last_ask"]:
+                suppress[state["last_ask"]] = max(
+                    suppress.get(state["last_ask"], 0.0),
+                    DECLINE_PENALTY if self._declined(message) else 1.0,
+                )
         # Dense retrieval reads the sentences as written; only the lexical side
         # wants a bag of terms.
         state["text"].append(message)
@@ -362,7 +417,12 @@ class Agent:
         return sorted(counts, key=lambda term: (-counts[term], term))
 
     def _choose(self, state: dict) -> str:
-        """Next question: the broadest one not already answered or retired."""
+        """Next question: least-suppressed, or the broadest untried one."""
+        if self._intent is not None:
+            suppress = state["suppress"]
+            return min(ATTRIBUTE_ORDER,
+                       key=lambda a: (suppress[a] if a in suppress else FRESH_COST,
+                                      ATTRIBUTE_ORDER.index(a)))
         for attribute in ATTRIBUTE_ORDER:
             if attribute in state["retired"] or attribute in state["asked"]:
                 continue
