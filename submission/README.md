@@ -1,8 +1,8 @@
 # Submission — setup and how to run
 
 Conversational retrieval agent for the TechJam Conversational E-Commerce Search
-Challenge. **No LLM, no network, no credentials.** See `REPORT.md` for method,
-results and limitations.
+Challenge. **No generative model, no network, no credentials.** See `REPORT.md`
+for method, results and limitations.
 
 ## What constitutes the submission
 
@@ -10,7 +10,8 @@ results and limitations.
 |---|---|
 | `starter/agent.py` | entry file, exports `Agent` |
 | `starter/stemmer.py` | vendored Porter stemmer (stdlib) |
-| `starter/dense.py` | optional dense retrieval (see below) |
+| `starter/intent.py` | intent detection over the embedding model |
+| `starter/dense.py` | ONNX encoder and vector search |
 | `requirements.txt` | dependency manifest |
 | `tools/` | test harnesses, not used at inference |
 
@@ -20,39 +21,29 @@ harness.
 
 ## Two supported configurations
 
-The agent runs in either of two modes, selected by one module flag in
-`starter/agent.py`. **Both are offline.** Configuration B is our recommendation
-unless the organiser confirms the extra assets are acceptable.
+Selected by one module flag. **Both are offline.** Configuration A is the
+default and the recommendation; B is a genuine fallback rather than a
+degradation path, and needs no install step of any kind.
 
-|  | A: with dense retrieval | B: BM25 only |
+|  | A: with the embedding model | B: stdlib only |
 |---|---|---|
-| `USE_DENSE` | `True` (default) | `False` |
-| public-set score | **0.8638** | 0.8598 |
-| natural-language harness | 0.9262 | **0.9297** |
+| public-set score | **0.8802** | 0.8598 |
+| natural-language harness | **0.9298** | 0.9297 |
+| boundary sessions | **0.80** hit | 0.60 hit |
 | Python | 3.12 | **3.9+, any** |
 | dependencies | onnxruntime, tokenizers, numpy | **none — stdlib only** |
-| local assets | 128 MB model + 73 MB matrix | **none** |
-| setup | download model, 18 min precompute | **none** |
+| local assets | 128 MB model + 56 KB prototypes | **none** |
+| agent memory | 577 MB | **328 MB** |
+| setup | download the model, build prototypes (seconds) | **none** |
 
-The 0.004 difference between them is within run-to-run noise, and B is ahead on
-the natural-language harness. B needs no install step of any kind.
+The model is used for **intent detection only** — deciding whether a customer
+answered a question or declined it. Dense product retrieval is off by default:
+it measured −0.004 once reranking existed, and turning it off also drops a
+73 MB matrix and an 18-minute precompute. `USE_DENSE = True` re-enables it.
 
-## Configuration B — BM25 only (recommended)
+## Configuration A — with the embedding model (default)
 
-Requires only a Python interpreter. No `pip install`, no assets, no network.
-
-```bash
-# in starter/agent.py set:  USE_DENSE = False
-python3 -m evaluator.local_evaluator --catalog data/catalog.jsonl \
-                                     --dataset data/public_set.jsonl \
-                                     --output results.json
-```
-
-Python 3.9 or newer. Verified on 3.9.6 and 3.12.13.
-
-## Configuration A — with dense retrieval
-
-**Python 3.12 required** (onnxruntime provides no wheel for the system 3.9 on
+**Python 3.12 required** (onnxruntime publishes no wheel for the system 3.9 on
 this platform).
 
 ```bash
@@ -62,14 +53,29 @@ python3.12 -m venv .venv
 # model: 3 files from BAAI/bge-small-en-v1.5 into models/bge-small-en-v1.5/
 #   onnx/model.onnx (127 MB), tokenizer.json, config.json
 
-.venv/bin/python tools/build_embeddings.py --catalog data/catalog.jsonl   # ~18 min
+.venv/bin/python tools/build_intent_prototypes.py        # seconds, writes 56 KB
 .venv/bin/python -m evaluator.local_evaluator --output results.json
 ```
 
-If the model or the embedding matrix is absent, the agent logs nothing and
-falls back to configuration B automatically — it does not fail. This is
-verified: with the artifacts deleted it scores exactly 0.8598 with zero
-exceptions.
+No catalog embedding step is needed. `tools/build_embeddings.py` is only
+required if you set `USE_DENSE = True`, and takes about 18 minutes.
+
+If the model or the prototypes are absent the agent falls back to
+configuration B automatically — it does not fail. Verified: with
+`models/` removed it scores exactly 0.8598 with zero exceptions.
+
+## Configuration B — stdlib only
+
+Requires only a Python interpreter. No `pip install`, no assets, no network.
+
+```bash
+# in starter/agent.py set:  MODEL_DIR = ""      (or simply delete models/)
+python3 -m evaluator.local_evaluator --catalog data/catalog.jsonl \
+                                     --dataset data/public_set.jsonl \
+                                     --output results.json
+```
+
+Python 3.9 or newer. Verified on 3.9.6 and 3.12.13.
 
 ## Environment variables
 

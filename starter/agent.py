@@ -405,8 +405,7 @@ class Agent:
         it is ignored - otherwise repeated boilerplate accrues weight and
         crowds out the terms that actually distinguish the target.
         """
-        if message in state["seen"]:
-            return
+        repeated = message in state["seen"]
         state["seen"].add(message)
         if self._intent is not None:
             suppress = state["suppress"]
@@ -417,6 +416,11 @@ class Agent:
                     suppress.get(state["last_ask"], 0.0),
                     DECLINE_PENALTY if self._declined(message) else 1.0,
                 )
+        if repeated:
+            # Nothing new to add to the query, but the question policy still
+            # advances - a customer repeating themselves verbatim should not
+            # freeze it.
+            return
         # Dense retrieval reads the sentences as written; only the lexical side
         # wants a bag of terms.
         state["text"].append(message)

@@ -1,7 +1,7 @@
 # Method, results and limitations
 
-**Public-set score 0.8638**, from a 0.1067 baseline. No LLM, no network, no
-credentials, no reported token usage. Median 43 ms per turn.
+**Public-set score 0.8802**, from a 0.1067 baseline. No generative model, no
+network, no credentials, no reported token usage. Median 38 ms per turn.
 
 ## Architecture
 
@@ -34,12 +34,18 @@ prior. **Reranking** — fusion selects plausible products but never judges them
 and BM25's disjunctive query lets a product matching 2 of 12 terms outrank one
 matching 10.
 
+A third matters more than its size suggests. A declined question was being
+treated as an answered one, so an attribute the customer waved away was retired
+permanently. In one measured session that consumed `feature`, the only
+attribute unlocking three of that session's four constraints, and the remaining
+turns asked about attributes that unlocked nothing.
+
 ## Results
 
 Reference evaluator, 200 public sessions:
 
 ```
-hit@10 0.940    MRR 0.778    MTTC 2.98    efficiency 0.802    score 0.8638
+hit@10 0.960    MRR 0.798    MTTC 2.96    efficiency 0.804    score 0.8802
 ```
 
 | increment | score | Δ |
@@ -50,39 +56,57 @@ hit@10 0.940    MRR 0.778    MTTC 2.98    efficiency 0.802    score 0.8638
 | + clarifying question each turn | 0.6973 | +0.477 |
 | + BGE-small dense retrieval | 0.7022 | +0.005 |
 | + retrieval depth 100 → 500 | 0.7081 | +0.006 |
-| + catalog reranking of the fused head | **0.8638** | +0.156 |
+| + catalog reranking of the fused head | 0.8638 | +0.156 |
+| + declined questions decay back into contention | 0.8760 | +0.012 |
+| + embedding model used for intent only, not retrieval | **0.8802** | +0.004 |
 
 By scenario:
 
 | scenario | n | hit@10 | MRR | MTTC |
 |---|---|---|---|---|
-| browsing | 80 | 0.975 | 0.789 | 2.73 |
-| buying | 80 | 0.950 | 0.787 | 2.39 |
-| intent override | 30 | 0.933 | 0.812 | 4.23 |
-| boundary | 10 | 0.600 | 0.517 | 6.00 |
+| browsing | 80 | 0.988 | 0.812 | 2.71 |
+| buying | 80 | 0.950 | 0.783 | 2.42 |
+| intent override | 30 | 0.967 | 0.831 | 4.03 |
+| boundary | 10 | 0.800 | 0.716 | 4.60 |
 
 ## Models and cost
 
 | | |
 |---|---|
 | generative model | **none** |
-| embedding model | BAAI/bge-small-en-v1.5, 33M params, ONNX on CPU |
+| embedding model | BAAI/bge-small-en-v1.5, 33M params, ONNX on CPU — **intent detection only** |
 | API calls | **zero** |
 | reported token usage | 0 prompt, 0 completion |
 | estimated model cost | **$0.00** |
-| median latency | 43 ms/turn (p95 92 ms), 131 ms/session |
+| median latency | 38 ms/turn (p95 91 ms), 113 ms/session |
 | index build | 18.2 s, of which 17.7 s is the two FTS5 indexes |
 | query encoding | 2 ms/turn |
-| agent memory | 301 MB BM25-only, 567 MB with dense retrieval |
+| agent memory | 328 MB stdlib-only, 577 MB with the model |
+| local assets | 128 MB model + 56 KB prototypes |
 
-The embedding model costs memory, not time: it adds 0.5 s to start-up and 2 ms
-per turn, against 266 MB of resident memory and 201 MB on disk. It is used for
-retrieval only. It runs under `onnxruntime` on
-CPU with no PyTorch dependency; the exported graph returns `last_hidden_state`,
-so CLS pooling and L2 normalisation are done explicitly (BGE pools CLS, not
-mean — mean pooling this model produces plausible-looking vectors that rank
-badly). See `README.md` for the BM25-only configuration, which drops the model
-entirely for 0.004 of score.
+The model was bought for retrieval and earns its place in classification
+instead. One encoder serves two consumers needing different artifacts:
+
+| use | artifact | worth |
+|---|---|---|
+| dense product retrieval | 73 MB catalog matrix | **−0.004** |
+| decline detection | 56 KB prototypes | **+0.020** |
+
+Encoding the conversation and cosining it against 50,000 product vectors stopped
+paying once reranking existed — the reranker absorbed what it contributed, and
+its residual effect is promoting semantically-similar-but-wrong products into
+the reranked head. Encoding each customer clause against 36 prototype sentences
+pays, because nothing else distinguishes a decline from an answer: catalog
+statistics cannot, the rarest new term in a decline having median IDF 1.34
+against a reveal's 1.15, with no usable threshold.
+
+So dense retrieval is off and its matrix is not built, which also removes an
+18-minute precompute. It costs memory, not time: 0.5 s of start-up and 2 ms per
+turn. It runs under `onnxruntime` on CPU with no PyTorch dependency; the
+exported graph returns `last_hidden_state`, so CLS pooling and L2 normalisation
+are done explicitly (BGE pools CLS, not mean — mean pooling this model produces
+plausible-looking vectors that rank badly). `README.md` documents the
+stdlib-only configuration, which drops the model for 0.020 of score.
 
 ## Validation beyond the reference evaluator
 
@@ -102,9 +126,8 @@ Degradation under paraphrase:
 
 | harness | score |
 |---|---|
-| reference evaluator | 0.8638 |
-| conversational frame reworded | 0.8062 |
-| frame and content reworded | 0.7130 |
+| reference evaluator | 0.8802 |
+| conversational frame reworded | 0.8307 |
 | `bucket-filter`, same treatment | 0.9364 → **0.3079** |
 
 ## Limitations
@@ -116,11 +139,11 @@ must find. `tools/category_harness.py` degrades that anchor in steps:
 
 | customer's wording | score |
 |---|---|
-| exact, as the evaluator gives it | 0.8638 |
-| head noun only ("sneaker") | 0.7828 |
-| everyday synonym ("trainer") | 0.7002 |
-| described, never named | 0.6436 |
-| no category at all | 0.6405 |
+| exact, as the evaluator gives it | 0.8802 |
+| head noun only ("sneaker") | 0.7993 |
+| everyday synonym ("trainer") | 0.7410 |
+| described, never named | 0.6811 |
+| no category at all | 0.6595 |
 
 That anchor is worth **0.22**, comparable to the reranker and the clarifying
 question combined. The private set is generated by the same code, so it will be
@@ -128,7 +151,8 @@ present there too — this measures the gap between the benchmark and a real
 deployment, not a scoring risk. We could not close it: dense retrieval is worth
 −0.003 at the synonym level, and a catalog-mined synonym table is worse still.
 
-**Boundary is weak** — hit 0.600 against 0.940 overall, on 10 sessions.
+**Boundary is still the weakest scenario** — hit 0.800 against 0.960 overall,
+on 10 sessions, though the decay policy recovered 4 of the 6 it was missing.
 
 **Efficiency is near its floor.** Override sessions cannot convert before turn
 3 by construction, capping MTTC around 1.375 and efficiency around 0.96.
@@ -152,7 +176,9 @@ Recorded because the negative results shaped the design.
 | dense retrieval at full weight | −0.014; finds the right kind of product, cannot pick which one |
 | adaptive score-gap cutoffs | −0.004 to −0.019; plain deeper retrieval beat every variant |
 | CombSUM over normalised scores | −0.006; rank order is more robust across incomparable score scales |
-| semantic intent detection | classification works (93% accuracy, override at 100% precision and recall) but no action on it helped: override decay −0.044, attribute retirement 0.000, term suppression −0.017 |
+| semantic intent detection, most actions | classification works (93% accuracy, override at 100% precision and recall) but only one action on it helped. Blanket override decay −0.044, attribute retirement 0.000, term suppression −0.017 message-level and −0.013 clause-level. Letting a *declined* attribute decay back into contention is the exception, at +0.012 |
+| re-asking a declined attribute at once | −0.002; it recovers the same boundary sessions but spends a turn doing it, and MTTC rises 2.98 → 3.21, cancelling the gain. Deferring the re-ask instead improves MTTC |
+| BM25 field weights | unchanged; ten configurations span 0.026 and flat 1.0 everywhere loses only 0.022. Boosting features and details, where the quoted constraint text lives, is worse |
 | catalog-mined synonym expansion | −0.022; polysemy — in a clothing catalog "trainer" means waist trainer |
 | categories-only retriever | −0.001; correlated with a column BM25 already weights |
 
