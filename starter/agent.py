@@ -32,6 +32,14 @@ MODEL_DIR = "models/bge-small-en-v1.5"
 EMBEDDINGS = "data/bge_embeddings"
 USE_DENSE = True
 QUERY_INSTRUCTION = True    # BGE v1.5 recommends an instruction on queries only
+# Dense retrieval adds recall and costs precision: at equal weight it raises
+# hit rate but pushes the exact match down the list, because embeddings find
+# the right kind of product and cannot pick which one. Down-weighting keeps the
+# recall. Measured official/realistic by weight: 0.00 -> .6973/.7765,
+# 0.15 -> .7027/.7864, 0.25 -> .7022/.7857, 0.50 -> .6987/.7883,
+# 1.00 -> .6897/.7690. Anything in 0.15-0.50 is within noise of the others; the
+# midpoint is taken rather than the argmax.
+DENSE_WEIGHT = 0.25
 
 # RM3 is implemented but off. Pseudo-relevance feedback assumes the first-pass
 # top-k is mostly relevant; this baseline's hit rate is 0.125, so the feedback
@@ -220,12 +228,12 @@ class Agent:
         return [token for token, _ in scored[:EXPANSION_TERMS]]
 
     @staticmethod
-    def _fuse(rankings: list[list[str]], top_k: int) -> list[str]:
+    def _fuse(rankings: list[tuple[list[str], float]], top_k: int) -> list[str]:
         """Reciprocal Rank Fusion - combines rankings using order alone."""
         scores: dict[str, float] = {}
-        for ranking in rankings:
+        for ranking, weight in rankings:
             for rank, pid in enumerate(ranking):
-                scores[pid] = scores.get(pid, 0.0) + 1.0 / (RRF_K + rank + 1)
+                scores[pid] = scores.get(pid, 0.0) + weight / (RRF_K + rank + 1)
         ordered = sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))
         return [pid for pid, _ in ordered[:top_k]]
 
@@ -293,20 +301,19 @@ class Agent:
         if key in self._cache:                     # same evidence, same answer
             ranked = self._cache[key]
             return self._reply(state, ranked)
+        stemmed_ranking = self._search("products_stem", stems, RETRIEVE)
         rankings = [
-            self._search("products", plain, RETRIEVE),
-            self._search("products_stem", stems, RETRIEVE),
+            (self._search("products", plain, RETRIEVE), 1.0),
+            (stemmed_ranking, 1.0),
+            (self._dense_ranking(" ".join(state["text"]), RETRIEVE), DENSE_WEIGHT),
         ]
-        dense = self._dense_ranking(" ".join(state["text"]), RETRIEVE)
-        if dense:
-            rankings.append(dense)
         if USE_EXPANSION:
-            rankings.append(self._search(
+            rankings.append((self._search(
                 "products_stem",
-                stems + self._expand(rankings[1][:FEEDBACK_DOCS], stems),
+                stems + self._expand(stemmed_ranking[:FEEDBACK_DOCS], stems),
                 RETRIEVE,
-            ))
-        ranked = self._fuse([r for r in rankings if r], top_k)
+            ), 1.0))
+        ranked = self._fuse([r for r in rankings if r[0]], top_k)
         self._cache[key] = ranked
         return self._reply(state, ranked)
 
