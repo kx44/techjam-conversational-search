@@ -31,6 +31,25 @@ DIGITS = re.compile(r"\d")
 # plain BM25 on natural-language input. Flip to True to re-check.
 USE_EXPANSION = False
 
+# Broad questions first, narrow ones after. A customer almost always has
+# something to say about what they will use an item for; far fewer have a
+# colour or material in mind, and those answers separate the catalog less.
+# Measured against both harnesses: broad-first 0.6973 / 0.7765 vs
+# narrow-first 0.6772 / 0.7690.
+ATTRIBUTE_ORDER = ("feature", "use_case", "style", "material", "color",
+                   "size", "budget", "brand", "category")
+QUESTIONS = {
+    "material": "What material would you prefer?",
+    "color": "Any particular colour you have in mind?",
+    "budget": "Roughly what budget are you working with?",
+    "style": "What sort of style or fit are you after?",
+    "size": "What size do you need?",
+    "use_case": "What will you mainly be using it for?",
+    "feature": "Is there a specific feature it has to have?",
+    "brand": "Is there a brand you tend to go for?",
+    "category": "What kind of item are we talking about exactly?",
+}
+
 
 def _text(value: object) -> str:
     if value is None:
@@ -97,7 +116,7 @@ class Agent:
                 raw.append((pid, *fields))
                 stems = [" ".join(_stemmed(field)) for field in fields]
                 stemmed.append((pid, *stems))
-                self._doc[pid] = " ".join(stems)
+                self._doc[pid] = " " + " ".join(stems) + " "
                 if len(raw) >= 1000:
                     cursor.executemany("INSERT INTO products VALUES (?,?,?,?,?,?,?)", raw)
                     cursor.executemany("INSERT INTO products_stem VALUES (?,?,?,?,?,?,?)", stemmed)
@@ -172,7 +191,10 @@ class Agent:
 
     def reset(self, session_id: str, user_profile: dict) -> None:
         # The profile is anonymized and may be used for personalization.
-        self._sessions[session_id] = {"seen": set(), "plain": {}, "stems": {}}
+        self._sessions[session_id] = {
+            "seen": set(), "plain": {}, "stems": {},
+            "asked": set(), "retired": set(), "last_ask": None, "size": 0,
+        }
 
     @staticmethod
     def _accumulate(state: dict, message: str) -> None:
@@ -194,6 +216,17 @@ class Agent:
     def _query(counts: dict[str, int]) -> list[str]:
         return sorted(counts, key=lambda term: (-counts[term], term))
 
+    def _choose(self, state: dict) -> str:
+        """Next question: the broadest one not already answered or retired."""
+        for attribute in ATTRIBUTE_ORDER:
+            if attribute in state["retired"] or attribute in state["asked"]:
+                continue
+            return attribute
+        for attribute in ATTRIBUTE_ORDER:            # everything asked once; reuse
+            if attribute not in state["retired"]:
+                return attribute
+        return "feature"
+
     def respond(
         self,
         session_id: str,
@@ -204,17 +237,18 @@ class Agent:
         state = self._sessions.get(session_id)
         if state is None:
             raise RuntimeError("reset must be called before respond")
+        before = len(state["plain"])
         self._accumulate(state, user_message)
+        if state["last_ask"] and len(state["plain"]) == before:
+            # Asked, learned nothing. Retire it rather than asking again.
+            state["retired"].add(state["last_ask"])
+        state["size"] = len(state["plain"])
         plain = self._query(state["plain"])
         stems = self._query(state["stems"])
         key = (tuple(plain), top_k)
         if key in self._cache:                     # same evidence, same answer
-            return {
-                "message": "Here are the closest matches I found.",
-                "ask_attribute": None,
-                "recommendations": [{"parent_asin": pid} for pid in self._cache[key]],
-                "usage": {"prompt_tokens": 0, "completion_tokens": 0},
-            }
+            ranked = self._cache[key]
+            return self._reply(state, ranked)
         rankings = [
             self._search("products", plain, RETRIEVE),
             self._search("products_stem", stems, RETRIEVE),
@@ -227,9 +261,15 @@ class Agent:
             ))
         ranked = self._fuse([r for r in rankings if r], top_k)
         self._cache[key] = ranked
+        return self._reply(state, ranked)
+
+    def _reply(self, state: dict, ranked: list[str]) -> dict:
+        attribute = self._choose(state)
+        state["asked"].add(attribute)
+        state["last_ask"] = attribute
         return {
-            "message": "Here are the closest matches I found.",
-            "ask_attribute": None,
+            "message": QUESTIONS.get(attribute, QUESTIONS["feature"]),
+            "ask_attribute": attribute,
             "recommendations": [{"parent_asin": pid} for pid in ranked],
             "usage": {"prompt_tokens": 0, "completion_tokens": 0},
         }
