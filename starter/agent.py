@@ -51,6 +51,29 @@ QUERY_INSTRUCTION = True    # BGE v1.5 recommends an instruction on queries only
 DENSE_WEIGHT = 0.25
 DENSE_LIMIT = RETRIEVE
 
+# Reranking. Fusion decides which products are plausible; this decides their
+# order. BM25 runs an OR query, so a product matching two query terms out of
+# twelve can outrank one matching ten, and phrases are shattered into tokens -
+# both are precisely what costs MRR when the target is in the list but not on
+# top. The reranker scores the head of the fused list on evidence the OR query
+# throws away: how much of the query a product actually covers, whether the
+# customer's phrases survive intact, and whether the match is in the title.
+RERANK_DEPTH = 50
+RERANK_WEIGHTS = {
+    "phrase": 0.8,      # adjacent query terms surviving as a phrase in the product
+    "popularity": 0.2,  # targets are real purchases, so common items are likelier
+    "price": 0.3,       # only applies once the customer names a budget
+}
+# Four other features were measured and dropped. Carrying the fusion score in
+# as a prior was the worst (0.7708 -> 0.8135 without it): RRF's ordering is
+# exactly what the reranker exists to correct, so anchoring to it re-imports
+# the flaw. Term coverage and title-match both helped filler - an accumulated
+# query is full of "what", "matters", "preference", and those match plenty of
+# product text - together costing 0.8135 -> 0.8625. Bigram phrases are immune,
+# because "what matters" appears in no catalog entry. Average rating did
+# nothing either way.
+PRICE_HINT = re.compile(r"\$\s*(\d+(?:\.\d+)?)|\b(?:under|below|around|about|up to)\s+(\d+(?:\.\d+)?)", re.I)
+
 # RM3 is implemented but off. Pseudo-relevance feedback assumes the first-pass
 # top-k is mostly relevant; this baseline's hit rate is 0.125, so the feedback
 # set is mostly wrong products and expansion amplifies the error. Measured:
@@ -117,6 +140,8 @@ class Agent:
         self.connection = sqlite3.connect(":memory:")
         self._sessions: dict[str, dict] = {}
         self._doc: dict[str, str] = {}   # stemmed content tokens, for RM3 feedback
+        self._pop: dict[str, float] = {}
+        self._price: dict[str, float] = {}
         self._df: dict[str, int] = {}
         self._cache: dict[tuple, list[str]] = {}
         self._vectors: dict[str, object] = {}
@@ -175,6 +200,10 @@ class Agent:
                 stems = [" ".join(_stemmed(field)) for field in fields]
                 stemmed.append((pid, *stems))
                 self._doc[pid] = " " + " ".join(stems) + " "
+                number = product.get("rating_number")
+                self._pop[pid] = math.log1p(number) if isinstance(number, int) else 0.0
+                price = product.get("price")
+                self._price[pid] = float(price) if isinstance(price, (int, float)) and price > 0 else 0.0
                 if len(raw) >= 1000:
                     cursor.executemany("INSERT INTO products VALUES (?,?,?,?,?,?,?)", raw)
                     cursor.executemany("INSERT INTO products_stem VALUES (?,?,?,?,?,?,?)", stemmed)
@@ -185,6 +214,7 @@ class Agent:
             cursor.executemany("INSERT INTO products_stem VALUES (?,?,?,?,?,?,?)", stemmed)
         self.connection.commit()
         self._docs = len(self._doc)
+        self._pop_max = max(self._pop.values()) or 1.0
 
     # ------------------------------------------------------------- retrieval
 
@@ -237,8 +267,30 @@ class Agent:
         scored = sorted(candidates.items(), key=lambda kv: -kv[1] * self._idf(kv[0]))
         return [token for token, _ in scored[:EXPANSION_TERMS]]
 
+    def _rerank(self, state: dict, fused: list[tuple[str, float]], top_k: int) -> list[str]:
+        """Reorder the head of the fused list using catalog evidence."""
+        head = fused[:RERANK_DEPTH]
+        if len(head) < 2:
+            return [pid for pid, _ in fused[:top_k]]
+        stems = list(state["stems"])
+        bigrams = [f" {a} {b} " for a, b in zip(stems, stems[1:])]
+        budget = state.get("budget")
+        weights = RERANK_WEIGHTS
+        scored: list[tuple[float, str]] = []
+        for pid, _ in head:
+            document = self._doc[pid]
+            phrase = sum(1 for b in bigrams if b in document) / len(bigrams) if bigrams else 0.0
+            score = (weights["phrase"] * phrase
+                     + weights["popularity"] * (self._pop[pid] / self._pop_max))
+            if budget and self._price[pid] > 0:
+                score += weights["price"] * max(0.0, 1.0 - abs(self._price[pid] - budget) / budget)
+            scored.append((-score, pid))
+        scored.sort()
+        reordered = [pid for _, pid in scored]
+        return (reordered + [pid for pid, _ in fused[RERANK_DEPTH:]])[:top_k]
+
     @staticmethod
-    def _fuse(rankings: list[tuple[list[str], float]], top_k: int) -> list[str]:
+    def _fuse(rankings: list[tuple[list[str], float]], top_k: int) -> list[tuple[str, float]]:
         """Reciprocal Rank Fusion - combines rankings using order alone.
 
         Score-magnitude fusion (CombSUM over min-max normalised scores) was
@@ -251,14 +303,14 @@ class Agent:
             for rank, pid in enumerate(ranking):
                 scores[pid] = scores.get(pid, 0.0) + weight / (RRF_K + rank + 1)
         ordered = sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))
-        return [pid for pid, _ in ordered[:top_k]]
+        return ordered[:top_k]
 
     def reset(self, session_id: str, user_profile: dict) -> None:
         # The profile is anonymized and may be used for personalization.
         self._sessions[session_id] = {
             "seen": set(), "plain": {}, "stems": {},
             "asked": set(), "retired": set(), "last_ask": None, "size": 0,
-            "text": [],
+            "text": [], "budget": None,
         }
 
     @staticmethod
@@ -275,6 +327,12 @@ class Agent:
         # Dense retrieval reads the sentences as written; only the lexical side
         # wants a bag of terms.
         state["text"].append(message)
+        hint = PRICE_HINT.search(message)
+        if hint:
+            try:
+                state["budget"] = float(hint.group(1) or hint.group(2))
+            except (TypeError, ValueError):
+                pass
         for term in _terms(message):
             state["plain"][term] = state["plain"].get(term, 0) + 1
         for term in _stemmed(message):
@@ -329,7 +387,8 @@ class Agent:
                 stems + self._expand(stemmed_ranking[:FEEDBACK_DOCS], stems),
                 RETRIEVE,
             ), 1.0))
-        ranked = self._fuse([r for r in rankings if r[0]], top_k)
+        fused = self._fuse([r for r in rankings if r[0]], max(top_k, RERANK_DEPTH))
+        ranked = self._rerank(state, fused, top_k)
         self._cache[key] = ranked
         return self._reply(state, ranked)
 
