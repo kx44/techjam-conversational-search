@@ -49,16 +49,19 @@ DIGITS = re.compile(r"\d")
 # missing artifact must degrade quietly rather than score zero.
 MODEL_DIR = "models/bge-small-en-v1.5"
 EMBEDDINGS = "data/bge_embeddings"
-# Dense product retrieval is off. The embedding model is still loaded - decline
-# detection needs it - but its catalog matrix is not, and the ranking does not
-# take part in fusion. Measured on both harnesses:
-#   model + catalog matrix + prototypes   0.8760 / 0.9263
-#   model + prototypes only               0.8802 / 0.9298   <- shipped
-#   no model at all                       0.8598 / 0.9297
-# Dense retrieval was worth +0.004 before reranking existed and -0.004 after,
-# because the reranker absorbed what it contributed. Dropping the matrix also
-# drops 73 MB and an 18-minute precompute. Set True to re-check.
-USE_DENSE = False
+# Dense product retrieval is ON in this branch. It is off on `pipeline`, where
+# it measured -0.004 once reranking existed - the reranker absorbed what it
+# contributed, and its residual effect was promoting semantically-similar-but-
+# wrong products into the reranked head. See DENSE_EXPERIMENT.md.
+#
+# That verdict rests on two harnesses whose customers both quote catalog text
+# close to verbatim, which is the regime least favourable to embeddings. This
+# branch exists to test it somewhere else.
+#
+# Requires data/bge_embeddings.npy (tools/build_embeddings.py, ~18 min). If the
+# matrix is absent the agent runs BM25-only and says nothing - check
+# `agent._index is not None` before trusting a null result.
+USE_DENSE = True
 QUERY_INSTRUCTION = True    # BGE v1.5 recommends an instruction on queries only
 # Dense retrieval adds recall and costs precision: at equal weight it raises
 # hit rate but pushes the exact match down the list, because embeddings find
