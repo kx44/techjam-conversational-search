@@ -81,6 +81,24 @@ QUERY_INSTRUCTION = True    # BGE v1.5 recommends an instruction on queries only
 DENSE_WEIGHT = 1.0
 DENSE_LIMIT = RETRIEVE
 
+# Intent override. The OVERRIDE class was recognised from the start but never
+# acted on, so a retraction left every superseded term in the query. Now the
+# newly stated value supersedes the earlier value of the SAME attribute:
+# "I'd like leather" then "I need canvas instead" drops leather, keeps canvas,
+# and keeps the category.
+#
+# Same-attribute is the only link available - the message names the new value
+# and never the old one ("ignore my earlier preference" has no referent), so
+# attribute identity is what makes the target identifiable at all. The cost of
+# that safety is that a retraction ACROSS attributes ("buckle closure ...
+# actually leather") is a real retraction and is not honoured.
+#
+# Bit-identical to off on all three harnesses. The evaluator draws old and new
+# from different slices of one candidate list, so they land on different
+# attributes (18/30) or on the same value (1/30), and 11/30 state a value
+# outside the known vocabulary - there is never a same-attribute conflict.
+USE_OVERRIDE = True
+
 # Reranking. Fusion decides which products are plausible; this decides their
 # order. BM25 runs an OR query, so a product matching two query terms out of
 # twelve can outrank one matching ten, and phrases are shattered into tokens -
@@ -206,6 +224,7 @@ class Agent:
         self._index = None
         self._intent = None
         self._intents: dict[str, bool] = {}
+        self._overrides: dict[str, bool] = {}
         self._build_index()
         self._load_model()
 
@@ -406,7 +425,51 @@ class Agent:
             "seen": set(), "plain": {}, "stems": {},
             "asked": set(), "retired": set(), "last_ask": None, "size": 0,
             "text": [], "budget": None, "suppress": {}, "phrases": set(),
+            "values": {},
         }
+
+    def _override(self, message: str) -> bool:
+        """Did the customer retract a preference rather than add one?"""
+        if self._intent is None or self._encoder is None:
+            return False
+        cached = self._overrides.get(message)
+        if cached is None:
+            from starter.intent import OVERRIDE
+
+            try:
+                cached = self._intent.classify_message(
+                    message, self._encoder)[0] == OVERRIDE
+            except Exception:
+                cached = False
+            self._overrides[message] = cached
+        return cached
+
+    def _drop_terms(self, state: dict, values: set[str]) -> None:
+        """Remove stated values from every representation that feeds retrieval."""
+        if not values:
+            return
+        stems = {stem(value) for value in values}
+        for value in values:
+            state["plain"].pop(value, None)
+        for token in stems:
+            state["stems"].pop(token, None)
+        state["phrases"] = {phrase for phrase in state["phrases"]
+                            if not any(f" {token} " in phrase for token in stems)}
+        # Dense reads the sentences, so the word has to leave those too - by
+        # excision, not by dropping the sentence, which would take the category
+        # anchor with it.
+        pattern = re.compile(r"\b(?:%s)\b" % "|".join(re.escape(v) for v in values), re.I)
+        state["text"] = [pattern.sub("", entry) for entry in state["text"]]
+
+    def _retract(self, state: dict, message: str) -> None:
+        """The stated value supersedes the earlier value of that attribute."""
+        from starter.intent import extract_values
+
+        stale = set()
+        for attribute, value in extract_values(message).items():
+            stale |= {old for old in state["values"].get(attribute, set())
+                      if old != value}
+        self._drop_terms(state, stale)
 
     def _accumulate(self, state: dict, message: str) -> None:
         """Fold one customer turn into the running query.
@@ -431,6 +494,18 @@ class Agent:
             # advances - a customer repeating themselves verbatim should not
             # freeze it.
             return
+        if USE_OVERRIDE and self._override(message):
+            # Safe on the opening turn without a guard: nothing has been
+            # recorded yet, so no value can be superseded.
+            self._retract(state, message)
+        self._absorb(state, message)
+        from starter.intent import extract_values
+
+        for attribute, value in extract_values(message).items():
+            state["values"].setdefault(attribute, set()).add(value)
+
+    def _absorb(self, state: dict, message: str) -> None:
+        """Fold one message's terms into the query representations."""
         # Dense retrieval reads the sentences as written; only the lexical side
         # wants a bag of terms.
         state["text"].append(message)
