@@ -11,15 +11,44 @@ baseline. Run it with `python3 -m evaluator.local_evaluator`. Setup is in
 ## The pipeline in one screen
 
 ```
-customer turn
-  ├─ CLASSIFY     answered or declined? each clause matched against 36
-  │               embedded prototype phrasings (BGE-small)
-  ├─ ACCUMULATE   fold into a running query: terms, and phrases from words
-  │               said next to each other in this message
-  ├─ RETRIEVE     BM25 raw terms, BM25 Porter-stemmed terms, 500 each
-  ├─ FUSE         weighted Reciprocal Rank Fusion, k=60 -> top 50
-  ├─ RERANK       phrase 0.8, popularity 0.2, price 0.3
-  └─ RESPOND      top 10, plus one question
+BUILT ONCE ── 18 s ──────────────────────────────────────────────────────────
+  50,000 products
+    ├── FTS5 index over 6 fields, raw tokens
+    ├── FTS5 index over 6 fields, Porter-stemmed
+    ├── per product: stemmed text · log1p(review count) · price
+    └── 36 prototype phrasings, embedded                            56 KB
+
+EVERY TURN ── 38 ms ─────────────────────────────────────────────────────────
+  customer message
+        │
+        ▼
+    CLASSIFY        split into clauses, embed each, nearest prototype
+        │           answered · declined · override · unknown
+        │           only "declined" changes behaviour
+        ▼
+    ACCUMULATE      skip if we have seen this exact text before, then fold in
+        │             content words          → query terms
+        │             adjacent words         → phrases  (bi- and trigrams)
+        │             "$40", "under 40"      → budget
+        │             the attribute we asked → suppress ×1, ×3 if declined
+        │                                      everything decays ×0.55/turn
+        │
+        ├──────────────────────┐
+        ▼                      ▼      500 candidates each,
+  BM25 raw tokens        BM25 stemmed  both at weight 1.0
+        │                      │
+        ├──────────────────────┘
+        ▼
+    FUSE            reciprocal rank fusion, k = 60
+        │           position only — the scores are discarded
+        ▼           top 50
+    RERANK          0.8 × phrase      query phrases intact in the product
+        │           0.2 × popularity  log1p(review count)
+        │           0.3 × price       only once a budget is named
+        ▼
+    10 products  +  1 question
+                    the least-suppressed attribute, broad before narrow
+─────────────────────────────────────────────────────────────────────────────
 ```
 
 Everything is per-session state; nothing is discarded between turns. Runs offline
