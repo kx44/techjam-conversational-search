@@ -14,11 +14,19 @@ from __future__ import annotations
 
 import hashlib
 import re
+from dataclasses import dataclass
 
 NORMAL = "NORMAL"
 OVERRIDE = "OVERRIDE"
 NO_PREFERENCE = "NO_PREFERENCE"
 UNKNOWN = "UNKNOWN"
+ACCEPT = "ACCEPT"
+REJECT = "REJECT"
+NEUTRAL = "NEUTRAL"
+HARD_REJECT = "HARD_REJECT"
+SOFT_REJECT = "SOFT_REJECT"
+SOFT_APPROVE = "SOFT_APPROVE"
+HARD_APPROVE = "HARD_APPROVE"
 
 # Varied phrasings per class - short, first person, the way a shopper writes.
 PROTOTYPES: dict[str, tuple[str, ...]] = {
@@ -89,6 +97,67 @@ SENTENCE = re.compile(r"(?<=[.!?;])\s+|\s+--\s+")
 # A non-NORMAL reading of any one clause decides the turn.
 PRIORITY = (OVERRIDE, NO_PREFERENCE, NORMAL)
 
+# Shopper preference clauses are shorter and more local than whole-turn intent.
+# Classify the relation around one masked attribute value at a time so the
+# material word itself cannot dominate the BGE comparison.
+CLAUSE_PROTOTYPES: dict[str, tuple[str, ...]] = {
+    ACCEPT: (
+        'Clause: "I like [VALUE]."\nPair: color=[VALUE]\nDoes the user want this value? yes, the user wants this value.',
+        'Clause: "[VALUE] works for me."\nPair: color=[VALUE]\nDoes the user want this value? yes, this value is acceptable.',
+        'Clause: "[VALUE] would be good."\nPair: material=[VALUE]\nDoes the user want this value? yes, the user prefers this value.',
+        'Clause: "I prefer [VALUE]."\nPair: material=[VALUE]\nDoes the user want this value? yes, the user prefers this value.',
+        'Clause: "A key requirement is: [VALUE]."\nPair: material=[VALUE]\nDoes the user want this value? yes, this value is required.',
+        'Clause: "For that, what matters is: [VALUE]."\nPair: material=[VALUE]\nDoes the user want this value? yes, this value matters.',
+        'Clause: "Something in [VALUE] is perfect."\nPair: color=[VALUE]\nDoes the user want this value? yes, this value is wanted.',
+        'Clause: "Yes, [VALUE] is fine."\nPair: color=[VALUE]\nDoes the user want this value? yes, this value is fine.',
+    ),
+    REJECT: (
+        'Clause: "I do not want [VALUE]."\nPair: material=[VALUE]\nDoes the user want this value? no, the user rejects this value.',
+        'Clause: "[VALUE] is not for me."\nPair: material=[VALUE]\nDoes the user want this value? no, this value is not acceptable.',
+        'Clause: "No [VALUE] please."\nPair: material=[VALUE]\nDoes the user want this value? no, the user does not want this value.',
+        'Clause: "Avoid [VALUE]."\nPair: color=[VALUE]\nDoes the user want this value? no, the user wants to avoid this value.',
+        'Clause: "Anything but [VALUE]."\nPair: color=[VALUE]\nDoes the user want this value? no, any value except this one.',
+        'Clause: "I am not looking for [VALUE]."\nPair: material=[VALUE]\nDoes the user want this value? no, this value is rejected.',
+        'Clause: "Without [VALUE]."\nPair: material=[VALUE]\nDoes the user want this value? no, this value should be excluded.',
+        'Clause: "I dislike [VALUE]."\nPair: color=[VALUE]\nDoes the user want this value? no, the user dislikes this value.',
+        'Clause: "[VALUE] will not work."\nPair: color=[VALUE]\nDoes the user want this value? no, this value will not work.',
+        'Clause: "I would rather not have [VALUE]."\nPair: material=[VALUE]\nDoes the user want this value? no, the user would rather avoid this value.',
+    ),
+    NEUTRAL: (
+        'Clause: "100% [VALUE]."\nPair: material=[VALUE]\nDoes the user want this value? neutral, this only describes a material.',
+        'Clause: "[VALUE] lining."\nPair: material=[VALUE]\nDoes the user want this value? neutral, this is a descriptive fragment.',
+        'Clause: "95% [VALUE], 5% spandex."\nPair: material=[VALUE]\nDoes the user want this value? neutral, this is product composition text.',
+        'Clause: "Body: [VALUE]."\nPair: material=[VALUE]\nDoes the user want this value? neutral, this only mentions the value.',
+        'Clause: "I do not have a preference."\nPair: material=[VALUE]\nDoes the user want this value? neutral, no preference is expressed.',
+        'Clause: "Either is fine with me."\nPair: color=[VALUE]\nDoes the user want this value? neutral, either option is fine.',
+        'Clause: "I am not sure yet."\nPair: material=[VALUE]\nDoes the user want this value? neutral, the user is undecided.',
+        'Clause: "Show me some options."\nPair: color=[VALUE]\nDoes the user want this value? neutral, the user is asking to browse.',
+    ),
+}
+CLAUSE_CLASSES = (ACCEPT, REJECT, NEUTRAL)
+CLAUSE_MIN_SIMILARITY = 0.50
+CLAUSE_MIN_MARGIN = 0.025
+CLAUSE_SPLIT = re.compile(
+    r"(?<=[.!?;])\s+|\s+--\s+|\s*,?\s+\b(?:but|however|though|although|except)\b\s+",
+    re.I,
+)
+
+
+@dataclass(frozen=True)
+class AttributeMention:
+    attribute: str
+    value: str
+
+
+@dataclass(frozen=True)
+class PreferenceSignal:
+    attribute: str
+    value: str
+    label: str
+    weight: float
+    confidence: float
+    scores: dict[str, float]
+
 
 def extract_values(message: str) -> dict[str, str]:
     """Attribute values stated in one message."""
@@ -102,6 +171,36 @@ def extract_values(message: str) -> dict[str, str]:
     if price:
         found["budget"] = price.group(1) or price.group(2)
     return found
+
+
+def split_clauses(message: str) -> list[str]:
+    """Small, deterministic clause splitter tuned for preference turns."""
+    return [clause.strip(" ,") for clause in CLAUSE_SPLIT.split(message) if len(clause.strip(" ,")) > 1]
+
+
+def extract_mentions(clause: str) -> list[AttributeMention]:
+    """Known product attribute values stated inside one clause."""
+    tokens = set(WORD.findall(clause.lower()))
+    mentions: list[AttributeMention] = []
+    for attribute, vocabulary in ATTRIBUTE_VALUES.items():
+        for value in vocabulary:
+            if value in tokens:
+                mentions.append(AttributeMention(attribute, value))
+    price = PRICE.search(clause)
+    if price:
+        mentions.append(AttributeMention("budget", price.group(1) or price.group(2)))
+    return mentions
+
+
+def relation_text(clause: str, mention: AttributeMention) -> str:
+    """Prompt-shaped text for relation classification around one value."""
+    value_pattern = re.compile(rf"\b{re.escape(mention.value)}\b", re.I)
+    masked = value_pattern.sub("[VALUE]", clause)
+    return (
+        f'Clause: "{masked}"\n'
+        f"Pair: {mention.attribute}=[VALUE]\n"
+        "Does the user want this value?"
+    )
 
 
 class IntentDetector:
@@ -161,6 +260,83 @@ class IntentDetector:
         if len(ranked) > 1 and ranked[0][1] - ranked[1][1] < MIN_MARGIN:
             return UNKNOWN, ranked[0][1]
         return ranked[0][0], ranked[0][1]
+
+
+class ClausePreferenceClassifier:
+    """Nearest-prototype preference classifier over BGE clause embeddings."""
+
+    def __init__(self, matrix, labels: list[str]) -> None:
+        self.matrix = matrix
+        self.labels = labels
+
+    @classmethod
+    def build(cls, encoder) -> "ClausePreferenceClassifier":
+        sentences: list[str] = []
+        labels: list[str] = []
+        for name in CLAUSE_CLASSES:
+            for sentence in CLAUSE_PROTOTYPES[name]:
+                sentences.append(sentence)
+                labels.append(name)
+        return cls(encoder.encode(sentences), labels)
+
+    def classify_clause(self, clause: str, encoder) -> tuple[str, float]:
+        vector = encoder.encode([clause])[0]
+        return self.classify(vector)
+
+    def classify_mention(self, clause: str, mention: AttributeMention, encoder) -> tuple[str, float]:
+        vector = encoder.encode([relation_text(clause, mention)])[0]
+        return self.classify(vector)
+
+    def score_mention(self, clause: str, mention: AttributeMention, encoder) -> PreferenceSignal:
+        vector = encoder.encode([relation_text(clause, mention)])[0]
+        scores = self.class_scores(vector)
+        accept = scores.get(ACCEPT, 0.0)
+        reject = scores.get(REJECT, 0.0)
+        neutral = scores.get(NEUTRAL, 0.0)
+        polarity = accept - reject
+        strength = max(accept, reject) - neutral
+        confidence = max(0.0, min(1.0, abs(polarity) + max(0.0, strength)))
+        if abs(polarity) < CLAUSE_MIN_MARGIN or max(accept, reject) < CLAUSE_MIN_SIMILARITY:
+            label = NEUTRAL
+            weight = 0.0
+        elif polarity < 0:
+            if strength >= CLAUSE_MIN_MARGIN:
+                label = HARD_REJECT
+                weight = -1.0
+            else:
+                label = SOFT_REJECT
+                weight = -0.5
+        elif strength >= CLAUSE_MIN_MARGIN:
+            label = HARD_APPROVE
+            weight = 1.0
+        else:
+            label = SOFT_APPROVE
+            weight = 0.5
+        return PreferenceSignal(
+            mention.attribute,
+            mention.value,
+            label,
+            weight,
+            confidence,
+            scores,
+        )
+
+    def classify(self, vector) -> tuple[str, float]:
+        ranked = sorted(self.class_scores(vector).items(), key=lambda kv: -kv[1])
+        if not ranked or ranked[0][1] < CLAUSE_MIN_SIMILARITY:
+            return NEUTRAL, ranked[0][1] if ranked else 0.0
+        if len(ranked) > 1 and ranked[0][1] - ranked[1][1] < CLAUSE_MIN_MARGIN:
+            return NEUTRAL, ranked[0][1]
+        return ranked[0][0], ranked[0][1]
+
+    def class_scores(self, vector) -> dict[str, float]:
+        scores = self.matrix @ vector
+        best: dict[str, float] = {}
+        for label, score in zip(self.labels, scores):
+            value = float(score)
+            if value > best.get(label, -1.0):
+                best[label] = value
+        return best
 
 
 def _fingerprint() -> str:

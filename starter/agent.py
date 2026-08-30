@@ -80,12 +80,14 @@ QUERY_INSTRUCTION = True    # BGE v1.5 recommends an instruction on queries only
 # midpoint is taken rather than the argmax.
 DENSE_WEIGHT = 1.0
 DENSE_LIMIT = RETRIEVE
+PREFERENCE_TERM_BOOST = 2
+PREFERENCE_DENSE_BOOST = 2
 
 # Intent override. The OVERRIDE class was recognised from the start but never
-# acted on, so a retraction left every superseded term in the query. Now the
-# newly stated value supersedes the earlier value of the SAME attribute:
-# "I'd like leather" then "I need canvas instead" drops leather, keeps canvas,
-# and keeps the category.
+# acted on, so a retraction left every superseded term in the query. The newly
+# stated value now supersedes the earlier value of the SAME attribute: "I'd
+# like leather" then "I need canvas instead" drops leather, keeps canvas, and
+# keeps the category.
 #
 # Same-attribute is the only link available - the message names the new value
 # and never the old one ("ignore my earlier preference" has no referent), so
@@ -93,8 +95,16 @@ DENSE_LIMIT = RETRIEVE
 # that safety is that a retraction ACROSS attributes ("buckle closure ...
 # actually leather") is a real retraction and is not honoured.
 #
-# Bit-identical to off on all three harnesses. The evaluator draws old and new
-# from different slices of one candidate list, so they land on different
+# MERGE NOTE. On its own branch this was implemented as `_drop_terms`, which
+# reached into `plain`, `stems`, `phrases` and `text` and deleted the stale
+# value in place. That cannot survive here: the preference layer rebuilds all
+# four of those from `positive_clauses` on every turn, so an in-place deletion
+# is erased by the next rebuild and the retraction silently stops working.
+# Superseded values are therefore recorded as state and excised *during* the
+# rebuild, which is idempotent and gives the same semantics.
+#
+# Bit-identical to off on the reference evaluator. That evaluator draws old and
+# new from different slices of one candidate list, so they land on different
 # attributes (18/30) or on the same value (1/30), and 11/30 state a value
 # outside the known vocabulary - there is never a same-attribute conflict.
 USE_OVERRIDE = True
@@ -225,6 +235,10 @@ class Agent:
         self._intent = None
         self._intents: dict[str, bool] = {}
         self._overrides: dict[str, bool] = {}
+        self._clause_classifier = None
+        self._clause_intents: dict[str, tuple[str, float]] = {}
+        self._mention_intents: dict[tuple[str, str, str], tuple[str, float]] = {}
+        self._mention_signals: dict[tuple[str, str, str], object] = {}
         self._build_index()
         self._load_model()
 
@@ -256,9 +270,18 @@ class Agent:
         try:
             from starter.intent import IntentDetector
 
-            self._intent = IntentDetector.load(PROTOTYPES)
+            try:
+                self._intent = IntentDetector.load(PROTOTYPES)
+            except Exception:
+                self._intent = IntentDetector.build(self._encoder)
         except Exception:
             self._intent = None
+        try:
+            from starter.intent import ClausePreferenceClassifier
+
+            self._clause_classifier = ClausePreferenceClassifier.build(self._encoder)
+        except Exception:
+            self._clause_classifier = None
 
     def _declined(self, message: str) -> bool:
         """Did the customer decline the question rather than answer it?
@@ -291,6 +314,56 @@ class Agent:
             return self._index.search(vector, limit)
         except Exception:
             return []
+
+    def _classify_clause(self, clause: str) -> tuple[str, float]:
+        if self._encoder is None or self._clause_classifier is None:
+            from starter.intent import NEUTRAL
+
+            return NEUTRAL, 0.0
+        cached = self._clause_intents.get(clause)
+        if cached is None:
+            try:
+                cached = self._clause_classifier.classify_clause(clause, self._encoder)
+            except Exception:
+                from starter.intent import NEUTRAL
+
+                cached = NEUTRAL, 0.0
+            self._clause_intents[clause] = cached
+        return cached
+
+    def _classify_mention(self, clause: str, mention) -> tuple[str, float]:
+        if self._encoder is None or self._clause_classifier is None:
+            from starter.intent import NEUTRAL
+
+            return NEUTRAL, 0.0
+        key = (clause, mention.attribute, mention.value)
+        cached = self._mention_intents.get(key)
+        if cached is None:
+            try:
+                cached = self._clause_classifier.classify_mention(clause, mention, self._encoder)
+            except Exception:
+                from starter.intent import NEUTRAL
+
+                cached = NEUTRAL, 0.0
+            self._mention_intents[key] = cached
+        return cached
+
+    def _score_mention(self, clause: str, mention):
+        if self._encoder is None or self._clause_classifier is None:
+            from starter.intent import NEUTRAL, PreferenceSignal
+
+            return PreferenceSignal(mention.attribute, mention.value, NEUTRAL, 0.0, 0.0, {})
+        key = (clause, mention.attribute, mention.value)
+        cached = self._mention_signals.get(key)
+        if cached is None:
+            try:
+                cached = self._clause_classifier.score_mention(clause, mention, self._encoder)
+            except Exception:
+                from starter.intent import NEUTRAL, PreferenceSignal
+
+                cached = PreferenceSignal(mention.attribute, mention.value, NEUTRAL, 0.0, 0.0, {})
+            self._mention_signals[key] = cached
+        return cached
 
     def _build_index(self) -> None:
         cursor = self.connection.cursor()
@@ -425,7 +498,8 @@ class Agent:
             "seen": set(), "plain": {}, "stems": {},
             "asked": set(), "retired": set(), "last_ask": None, "size": 0,
             "text": [], "budget": None, "suppress": {}, "phrases": set(),
-            "values": {},
+            "positive_clauses": [], "accepted": {}, "rejected": {}, "preferences": {},
+            "values": {}, "superseded": {},
         }
 
     def _override(self, message: str) -> bool:
@@ -444,32 +518,101 @@ class Agent:
             self._overrides[message] = cached
         return cached
 
-    def _drop_terms(self, state: dict, values: set[str]) -> None:
-        """Remove stated values from every representation that feeds retrieval."""
-        if not values:
-            return
-        stems = {stem(value) for value in values}
-        for value in values:
-            state["plain"].pop(value, None)
-        for token in stems:
-            state["stems"].pop(token, None)
-        state["phrases"] = {phrase for phrase in state["phrases"]
-                            if not any(f" {token} " in phrase for token in stems)}
-        # Dense reads the sentences, so the word has to leave those too - by
-        # excision, not by dropping the sentence, which would take the category
-        # anchor with it.
-        pattern = re.compile(r"\b(?:%s)\b" % "|".join(re.escape(v) for v in values), re.I)
-        state["text"] = [pattern.sub("", entry) for entry in state["text"]]
-
     def _retract(self, state: dict, message: str) -> None:
-        """The stated value supersedes the earlier value of that attribute."""
+        """Record that this turn's value supersedes the attribute's earlier one.
+
+        Nothing is deleted here. The rebuild is the single place that decides
+        what reaches retrieval, so a retraction has to be a fact it consults,
+        not an edit it will overwrite.
+        """
         from starter.intent import extract_values
 
-        stale = set()
         for attribute, value in extract_values(message).items():
-            stale |= {old for old in state["values"].get(attribute, set())
-                      if old != value}
-        self._drop_terms(state, stale)
+            for old in state["values"].get(attribute, set()):
+                if old != value:
+                    self._remember(state["superseded"], attribute, old)
+            # A value stated now is wanted now, whatever was said before.
+            self._forget(state["superseded"], attribute, value)
+
+    def _add_positive_clause(self, state: dict, clause: str) -> None:
+        state["positive_clauses"].append(clause)
+
+    @staticmethod
+    def _remember(mapping: dict, attribute: str, value: str) -> None:
+        mapping.setdefault(attribute, set()).add(value)
+
+    @staticmethod
+    def _forget(mapping: dict, attribute: str, value: str) -> None:
+        values = mapping.get(attribute)
+        if not values:
+            return
+        values.discard(value)
+        if not values:
+            mapping.pop(attribute, None)
+
+    @staticmethod
+    def _strip(state: dict, clause: str) -> str:
+        """One clause with every superseded value removed.
+
+        Excision, not exclusion: dropping the whole clause would take the
+        category anchor with it, and that anchor is worth more than the stale
+        value costs.
+        """
+        stale = {v for values in state["superseded"].values() for v in values}
+        if not stale:
+            return clause
+        pattern = re.compile(r"\b(?:%s)\b" % "|".join(re.escape(v) for v in sorted(stale)), re.I)
+        return pattern.sub(" ", clause)
+
+    def _rebuild_positive_state(self, state: dict) -> None:
+        state["plain"].clear()
+        state["stems"].clear()
+        state["phrases"].clear()
+        positive_clauses = []
+        for clause in state["positive_clauses"]:
+            try:
+                from starter.intent import extract_mentions
+
+                mentions = extract_mentions(clause)
+            except Exception:
+                mentions = []
+            if any(mention.value in state["rejected"].get(mention.attribute, set())
+                   for mention in mentions):
+                continue
+            positive_clauses.append(clause)
+        positive_clauses = [self._strip(state, clause) for clause in positive_clauses]
+        dense_clauses = list(positive_clauses)
+        state["budget"] = None
+        for clause in positive_clauses:
+            hint = PRICE_HINT.search(clause)
+            if hint:
+                try:
+                    state["budget"] = float(hint.group(1) or hint.group(2))
+                except (TypeError, ValueError):
+                    pass
+            for term in _terms(clause):
+                state["plain"][term] = state["plain"].get(term, 0) + 1
+            sequence = _stemmed(clause)
+            for term in sequence:
+                state["stems"][term] = state["stems"].get(term, 0) + 1
+            # Phrases come from adjacency *within one accepted evidence clause*.
+            # Rejected clauses must not contribute phrase features either.
+            state["phrases"].update(f" {a} {b} " for a, b in zip(sequence, sequence[1:]))
+            state["phrases"].update(f" {a} {b} {c} "
+                                    for a, b, c in zip(sequence, sequence[1:], sequence[2:]))
+        for (attribute, value), signal in state["preferences"].items():
+            if signal.weight <= 0 or value in state["rejected"].get(attribute, set()):
+                continue
+            if value in state["superseded"].get(attribute, set()):
+                continue
+            repeats = max(1, round(signal.weight * PREFERENCE_TERM_BOOST))
+            for term in _terms(value):
+                state["plain"][term] = state["plain"].get(term, 0) + repeats
+            for term in _stemmed(value):
+                state["stems"][term] = state["stems"].get(term, 0) + repeats
+            dense_repeats = max(1, round(signal.weight * PREFERENCE_DENSE_BOOST))
+            dense_clauses.extend(f"{attribute} {value}" for _ in range(dense_repeats))
+        state["text"] = dense_clauses
 
     def _accumulate(self, state: dict, message: str) -> None:
         """Fold one customer turn into the running query.
@@ -498,36 +641,42 @@ class Agent:
             # Safe on the opening turn without a guard: nothing has been
             # recorded yet, so no value can be superseded.
             self._retract(state, message)
-        self._absorb(state, message)
         from starter.intent import extract_values
 
         for attribute, value in extract_values(message).items():
             state["values"].setdefault(attribute, set()).add(value)
+        if self._clause_classifier is None or self._encoder is None:
+            self._add_positive_clause(state, message)
+            self._rebuild_positive_state(state)
+            return
+        from starter.intent import NEUTRAL, extract_mentions, split_clauses
+        from starter.intent import HARD_APPROVE, HARD_REJECT, SOFT_APPROVE, SOFT_REJECT
 
-    def _absorb(self, state: dict, message: str) -> None:
-        """Fold one message's terms into the query representations."""
-        # Dense retrieval reads the sentences as written; only the lexical side
-        # wants a bag of terms.
-        state["text"].append(message)
-        hint = PRICE_HINT.search(message)
-        if hint:
-            try:
-                state["budget"] = float(hint.group(1) or hint.group(2))
-            except (TypeError, ValueError):
-                pass
-        for term in _terms(message):
-            state["plain"][term] = state["plain"].get(term, 0) + 1
-        sequence = _stemmed(message)
-        for term in sequence:
-            state["stems"][term] = state["stems"].get(term, 0) + 1
-        # Phrases come from adjacency *within this message*. Deriving them from
-        # the accumulated term dict instead - consecutive distinct stems in
-        # first-seen order - loses real adjacency and invents pairs spanning
-        # message boundaries. Measured: 0.8802 -> 0.8922 official and
-        # 0.9298 -> 0.9389 on natural language.
-        state["phrases"].update(f" {a} {b} " for a, b in zip(sequence, sequence[1:]))
-        state["phrases"].update(f" {a} {b} {c} "
-                                for a, b, c in zip(sequence, sequence[1:], sequence[2:]))
+        for clause in split_clauses(message):
+            mentions = extract_mentions(clause)
+            if mentions:
+                rejected = False
+                for mention in mentions:
+                    signal = self._score_mention(clause, mention)
+                    state["preferences"][(mention.attribute, mention.value)] = signal
+                    if signal.label != HARD_REJECT:
+                        continue
+                    self._remember(state["rejected"], mention.attribute, mention.value)
+                    self._forget(state["accepted"], mention.attribute, mention.value)
+                    rejected = True
+                if rejected:
+                    continue
+                for mention in mentions:
+                    signal = self._score_mention(clause, mention)
+                    if signal.label in (HARD_APPROVE, SOFT_APPROVE, NEUTRAL):
+                        self._forget(state["rejected"], mention.attribute, mention.value)
+                        self._remember(state["accepted"], mention.attribute, mention.value)
+                self._add_positive_clause(state, clause)
+                continue
+            if self._declined(clause):
+                continue
+            self._add_positive_clause(state, clause)
+        self._rebuild_positive_state(state)
 
     @staticmethod
     def _query(counts: dict[str, int]) -> list[str]:
