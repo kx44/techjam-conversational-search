@@ -195,6 +195,8 @@ class Agent:
         self._index = None
         self._intent = None
         self._intents: dict[str, bool] = {}
+        self._clause_classifier = None
+        self._clause_intents: dict[str, tuple[str, float]] = {}
         self._build_index()
         self._load_model()
 
@@ -226,9 +228,18 @@ class Agent:
         try:
             from starter.intent import IntentDetector
 
-            self._intent = IntentDetector.load(PROTOTYPES)
+            try:
+                self._intent = IntentDetector.load(PROTOTYPES)
+            except Exception:
+                self._intent = IntentDetector.build(self._encoder)
         except Exception:
             self._intent = None
+        try:
+            from starter.intent import ClausePreferenceClassifier
+
+            self._clause_classifier = ClausePreferenceClassifier.build(self._encoder)
+        except Exception:
+            self._clause_classifier = None
 
     def _declined(self, message: str) -> bool:
         """Did the customer decline the question rather than answer it?
@@ -261,6 +272,22 @@ class Agent:
             return self._index.search(vector, limit)
         except Exception:
             return []
+
+    def _classify_clause(self, clause: str) -> tuple[str, float]:
+        if self._encoder is None or self._clause_classifier is None:
+            from starter.intent import NEUTRAL
+
+            return NEUTRAL, 0.0
+        cached = self._clause_intents.get(clause)
+        if cached is None:
+            try:
+                cached = self._clause_classifier.classify_clause(clause, self._encoder)
+            except Exception:
+                from starter.intent import NEUTRAL
+
+                cached = NEUTRAL, 0.0
+            self._clause_intents[clause] = cached
+        return cached
 
     def _build_index(self) -> None:
         cursor = self.connection.cursor()
@@ -395,7 +422,60 @@ class Agent:
             "seen": set(), "plain": {}, "stems": {},
             "asked": set(), "retired": set(), "last_ask": None, "size": 0,
             "text": [], "budget": None, "suppress": {}, "phrases": set(),
+            "positive_clauses": [], "accepted": {}, "rejected": {},
         }
+
+    def _add_positive_clause(self, state: dict, clause: str) -> None:
+        state["positive_clauses"].append(clause)
+
+    @staticmethod
+    def _remember(mapping: dict, attribute: str, value: str) -> None:
+        mapping.setdefault(attribute, set()).add(value)
+
+    @staticmethod
+    def _forget(mapping: dict, attribute: str, value: str) -> None:
+        values = mapping.get(attribute)
+        if not values:
+            return
+        values.discard(value)
+        if not values:
+            mapping.pop(attribute, None)
+
+    def _rebuild_positive_state(self, state: dict) -> None:
+        state["plain"].clear()
+        state["stems"].clear()
+        state["phrases"].clear()
+        positive_clauses = []
+        for clause in state["positive_clauses"]:
+            try:
+                from starter.intent import extract_mentions
+
+                mentions = extract_mentions(clause)
+            except Exception:
+                mentions = []
+            if any(mention.value in state["rejected"].get(mention.attribute, set())
+                   for mention in mentions):
+                continue
+            positive_clauses.append(clause)
+        state["text"] = positive_clauses
+        state["budget"] = None
+        for clause in positive_clauses:
+            hint = PRICE_HINT.search(clause)
+            if hint:
+                try:
+                    state["budget"] = float(hint.group(1) or hint.group(2))
+                except (TypeError, ValueError):
+                    pass
+            for term in _terms(clause):
+                state["plain"][term] = state["plain"].get(term, 0) + 1
+            sequence = _stemmed(clause)
+            for term in sequence:
+                state["stems"][term] = state["stems"].get(term, 0) + 1
+            # Phrases come from adjacency *within one accepted evidence clause*.
+            # Rejected clauses must not contribute phrase features either.
+            state["phrases"].update(f" {a} {b} " for a, b in zip(sequence, sequence[1:]))
+            state["phrases"].update(f" {a} {b} {c} "
+                                    for a, b, c in zip(sequence, sequence[1:], sequence[2:]))
 
     def _accumulate(self, state: dict, message: str) -> None:
         """Fold one customer turn into the running query.
@@ -420,28 +500,30 @@ class Agent:
             # advances - a customer repeating themselves verbatim should not
             # freeze it.
             return
-        # Dense retrieval reads the sentences as written; only the lexical side
-        # wants a bag of terms.
-        state["text"].append(message)
-        hint = PRICE_HINT.search(message)
-        if hint:
-            try:
-                state["budget"] = float(hint.group(1) or hint.group(2))
-            except (TypeError, ValueError):
-                pass
-        for term in _terms(message):
-            state["plain"][term] = state["plain"].get(term, 0) + 1
-        sequence = _stemmed(message)
-        for term in sequence:
-            state["stems"][term] = state["stems"].get(term, 0) + 1
-        # Phrases come from adjacency *within this message*. Deriving them from
-        # the accumulated term dict instead - consecutive distinct stems in
-        # first-seen order - loses real adjacency and invents pairs spanning
-        # message boundaries. Measured: 0.8802 -> 0.8922 official and
-        # 0.9298 -> 0.9389 on natural language.
-        state["phrases"].update(f" {a} {b} " for a, b in zip(sequence, sequence[1:]))
-        state["phrases"].update(f" {a} {b} {c} "
-                                for a, b, c in zip(sequence, sequence[1:], sequence[2:]))
+        if self._clause_classifier is None or self._encoder is None:
+            self._add_positive_clause(state, message)
+            self._rebuild_positive_state(state)
+            return
+        from starter.intent import ACCEPT, NEUTRAL, REJECT, extract_mentions, split_clauses
+
+        for clause in split_clauses(message):
+            verdict, _ = self._classify_clause(clause)
+            mentions = extract_mentions(clause)
+            if verdict == REJECT and mentions:
+                for mention in mentions:
+                    self._remember(state["rejected"], mention.attribute, mention.value)
+                    self._forget(state["accepted"], mention.attribute, mention.value)
+                continue
+            if verdict == ACCEPT:
+                for mention in mentions:
+                    self._forget(state["rejected"], mention.attribute, mention.value)
+                    self._remember(state["accepted"], mention.attribute, mention.value)
+                self._add_positive_clause(state, clause)
+                continue
+            if verdict == NEUTRAL and self._declined(clause):
+                continue
+            self._add_positive_clause(state, clause)
+        self._rebuild_positive_state(state)
 
     @staticmethod
     def _query(counts: dict[str, int]) -> list[str]:

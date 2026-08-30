@@ -14,11 +14,15 @@ from __future__ import annotations
 
 import hashlib
 import re
+from dataclasses import dataclass
 
 NORMAL = "NORMAL"
 OVERRIDE = "OVERRIDE"
 NO_PREFERENCE = "NO_PREFERENCE"
 UNKNOWN = "UNKNOWN"
+ACCEPT = "ACCEPT"
+REJECT = "REJECT"
+NEUTRAL = "NEUTRAL"
 
 # Varied phrasings per class - short, first person, the way a shopper writes.
 PROTOTYPES: dict[str, tuple[str, ...]] = {
@@ -89,6 +93,66 @@ SENTENCE = re.compile(r"(?<=[.!?;])\s+|\s+--\s+")
 # A non-NORMAL reading of any one clause decides the turn.
 PRIORITY = (OVERRIDE, NO_PREFERENCE, NORMAL)
 
+# Shopper preference clauses are shorter and more local than whole-turn intent:
+# "I like black, but leather isn't for me" carries one accepted value and one
+# rejected value. These prototypes classify the clause before the caller pairs
+# the verdict with any attribute values found inside that same clause.
+CLAUSE_PROTOTYPES: dict[str, tuple[str, ...]] = {
+    ACCEPT: (
+        "I like black.",
+        "Black works for me.",
+        "Leather would be good.",
+        "I prefer leather.",
+        "Cotton is ideal.",
+        "Yes, blue is fine.",
+        "I want something wool.",
+        "A suede one would be nice.",
+        "I am after a red option.",
+        "That material sounds good.",
+        "I would happily take polyester.",
+        "Something in navy is perfect.",
+    ),
+    REJECT: (
+        "I do not want leather.",
+        "Leather is not for me.",
+        "No leather please.",
+        "Avoid black.",
+        "Anything but black.",
+        "I am not looking for wool.",
+        "Without polyester.",
+        "I dislike red.",
+        "Black will not work.",
+        "Please exclude suede.",
+        "I would rather not have cotton.",
+        "Keep it away from nylon.",
+    ),
+    NEUTRAL: (
+        "I do not have a preference.",
+        "Either is fine with me.",
+        "I am not sure yet.",
+        "Show me some options.",
+        "That does not matter much.",
+        "Use your judgment there.",
+        "Maybe something practical.",
+        "What do you recommend?",
+        "I am open on that.",
+        "No strong opinion.",
+    ),
+}
+CLAUSE_CLASSES = (ACCEPT, REJECT, NEUTRAL)
+CLAUSE_MIN_SIMILARITY = 0.54
+CLAUSE_MIN_MARGIN = 0.015
+CLAUSE_SPLIT = re.compile(
+    r"(?<=[.!?;])\s+|\s+--\s+|\s*,?\s+\b(?:but|however|though|although|except)\b\s+",
+    re.I,
+)
+
+
+@dataclass(frozen=True)
+class AttributeMention:
+    attribute: str
+    value: str
+
 
 def extract_values(message: str) -> dict[str, str]:
     """Attribute values stated in one message."""
@@ -102,6 +166,25 @@ def extract_values(message: str) -> dict[str, str]:
     if price:
         found["budget"] = price.group(1) or price.group(2)
     return found
+
+
+def split_clauses(message: str) -> list[str]:
+    """Small, deterministic clause splitter tuned for preference turns."""
+    return [clause.strip(" ,") for clause in CLAUSE_SPLIT.split(message) if len(clause.strip(" ,")) > 1]
+
+
+def extract_mentions(clause: str) -> list[AttributeMention]:
+    """Known product attribute values stated inside one clause."""
+    tokens = set(WORD.findall(clause.lower()))
+    mentions: list[AttributeMention] = []
+    for attribute, vocabulary in ATTRIBUTE_VALUES.items():
+        for value in vocabulary:
+            if value in tokens:
+                mentions.append(AttributeMention(attribute, value))
+    price = PRICE.search(clause)
+    if price:
+        mentions.append(AttributeMention("budget", price.group(1) or price.group(2)))
+    return mentions
 
 
 class IntentDetector:
@@ -160,6 +243,42 @@ class IntentDetector:
             return UNKNOWN, ranked[0][1] if ranked else 0.0
         if len(ranked) > 1 and ranked[0][1] - ranked[1][1] < MIN_MARGIN:
             return UNKNOWN, ranked[0][1]
+        return ranked[0][0], ranked[0][1]
+
+
+class ClausePreferenceClassifier:
+    """Nearest-prototype preference classifier over BGE clause embeddings."""
+
+    def __init__(self, matrix, labels: list[str]) -> None:
+        self.matrix = matrix
+        self.labels = labels
+
+    @classmethod
+    def build(cls, encoder) -> "ClausePreferenceClassifier":
+        sentences: list[str] = []
+        labels: list[str] = []
+        for name in CLAUSE_CLASSES:
+            for sentence in CLAUSE_PROTOTYPES[name]:
+                sentences.append(sentence)
+                labels.append(name)
+        return cls(encoder.encode(sentences), labels)
+
+    def classify_clause(self, clause: str, encoder) -> tuple[str, float]:
+        vector = encoder.encode([clause])[0]
+        return self.classify(vector)
+
+    def classify(self, vector) -> tuple[str, float]:
+        scores = self.matrix @ vector
+        best: dict[str, float] = {}
+        for label, score in zip(self.labels, scores):
+            value = float(score)
+            if value > best.get(label, -1.0):
+                best[label] = value
+        ranked = sorted(best.items(), key=lambda kv: -kv[1])
+        if not ranked or ranked[0][1] < CLAUSE_MIN_SIMILARITY:
+            return NEUTRAL, ranked[0][1] if ranked else 0.0
+        if len(ranked) > 1 and ranked[0][1] - ranked[1][1] < CLAUSE_MIN_MARGIN:
+            return NEUTRAL, ranked[0][1]
         return ranked[0][0], ranked[0][1]
 
 
