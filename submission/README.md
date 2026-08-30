@@ -27,8 +27,8 @@ degradation path, and needs no install step of any kind.
 
 |  | A: with the embedding model | B: stdlib only |
 |---|---|---|
-| public-set score | **0.8802** | 0.8598 |
-| natural-language harness | **0.9298** | 0.9297 |
+| public-set score | **0.8922** | 0.8598 |
+| natural-language harness | **0.9389** | 0.9297 |
 | boundary sessions | **0.80** hit | 0.60 hit |
 | Python | 3.12 | **3.9+, any** |
 | dependencies | onnxruntime, tokenizers, numpy | **none — stdlib only** |

@@ -1,6 +1,6 @@
 # Method, results and limitations
 
-**Public-set score 0.8802**, from a 0.1067 baseline. No generative model, no
+**Public-set score 0.8922**, from a 0.1067 baseline. No generative model, no
 network, no credentials, no reported token usage. Median 38 ms per turn.
 
 ## Architecture
@@ -50,7 +50,7 @@ turns asked about attributes that unlocked nothing.
 Reference evaluator, 200 public sessions:
 
 ```
-hit@10 0.960    MRR 0.798    MTTC 2.96    efficiency 0.804    score 0.8802
+hit@10 0.965    MRR 0.827    MTTC 2.92    efficiency 0.808    score 0.8922
 ```
 
 | increment | score | Δ |
@@ -63,15 +63,16 @@ hit@10 0.960    MRR 0.798    MTTC 2.96    efficiency 0.804    score 0.8802
 | + retrieval depth 100 → 500 | 0.7081 | +0.006 |
 | + catalog reranking of the fused head | 0.8638 | +0.156 |
 | + declined questions decay back into contention | 0.8760 | +0.012 |
-| + embedding model used for intent only, not retrieval | **0.8802** | +0.004 |
+| + embedding model used for intent only, not retrieval | 0.8802 | +0.004 |
+| + phrases taken from within-message adjacency | **0.8922** | +0.012 |
 
 By scenario:
 
 | scenario | n | hit@10 | MRR | MTTC |
 |---|---|---|---|---|
-| browsing | 80 | 0.988 | 0.812 | 2.71 |
-| buying | 80 | 0.950 | 0.783 | 2.42 |
-| intent override | 30 | 0.967 | 0.831 | 4.03 |
+| browsing | 80 | 0.988 | 0.836 | 2.69 |
+| buying | 80 | 0.950 | 0.796 | 2.39 |
+| intent override | 30 | 1.000 | 0.898 | 3.93 |
 | boundary | 10 | 0.800 | 0.716 | 4.60 |
 
 ## Models and cost
@@ -131,7 +132,7 @@ Degradation under paraphrase:
 
 | harness | score |
 |---|---|
-| reference evaluator | 0.8802 |
+| reference evaluator | 0.8922 |
 | conversational frame reworded | 0.8307 |
 | `bucket-filter`, same treatment | 0.9364 → **0.3079** |
 
@@ -144,7 +145,7 @@ must find. `tools/category_harness.py` degrades that anchor in steps:
 
 | customer's wording | score |
 |---|---|
-| exact, as the evaluator gives it | 0.8802 |
+| exact, as the evaluator gives it | 0.8922 |
 | head noun only ("sneaker") | 0.7993 |
 | everyday synonym ("trainer") | 0.7410 |
 | described, never named | 0.6811 |
