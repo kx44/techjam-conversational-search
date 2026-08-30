@@ -23,6 +23,10 @@ UNKNOWN = "UNKNOWN"
 ACCEPT = "ACCEPT"
 REJECT = "REJECT"
 NEUTRAL = "NEUTRAL"
+HARD_REJECT = "HARD_REJECT"
+SOFT_REJECT = "SOFT_REJECT"
+SOFT_APPROVE = "SOFT_APPROVE"
+HARD_APPROVE = "HARD_APPROVE"
 
 # Varied phrasings per class - short, first person, the way a shopper writes.
 PROTOTYPES: dict[str, tuple[str, ...]] = {
@@ -93,55 +97,46 @@ SENTENCE = re.compile(r"(?<=[.!?;])\s+|\s+--\s+")
 # A non-NORMAL reading of any one clause decides the turn.
 PRIORITY = (OVERRIDE, NO_PREFERENCE, NORMAL)
 
-# Shopper preference clauses are shorter and more local than whole-turn intent:
-# "I like black, but leather isn't for me" carries one accepted value and one
-# rejected value. These prototypes classify the clause before the caller pairs
-# the verdict with any attribute values found inside that same clause.
+# Shopper preference clauses are shorter and more local than whole-turn intent.
+# Classify the relation around one masked attribute value at a time so the
+# material word itself cannot dominate the BGE comparison.
 CLAUSE_PROTOTYPES: dict[str, tuple[str, ...]] = {
     ACCEPT: (
-        "I like black.",
-        "Black works for me.",
-        "Leather would be good.",
-        "I prefer leather.",
-        "Cotton is ideal.",
-        "Yes, blue is fine.",
-        "I want something wool.",
-        "A suede one would be nice.",
-        "I am after a red option.",
-        "That material sounds good.",
-        "I would happily take polyester.",
-        "Something in navy is perfect.",
+        'Clause: "I like [VALUE]."\nPair: color=[VALUE]\nDoes the user want this value? yes, the user wants this value.',
+        'Clause: "[VALUE] works for me."\nPair: color=[VALUE]\nDoes the user want this value? yes, this value is acceptable.',
+        'Clause: "[VALUE] would be good."\nPair: material=[VALUE]\nDoes the user want this value? yes, the user prefers this value.',
+        'Clause: "I prefer [VALUE]."\nPair: material=[VALUE]\nDoes the user want this value? yes, the user prefers this value.',
+        'Clause: "A key requirement is: [VALUE]."\nPair: material=[VALUE]\nDoes the user want this value? yes, this value is required.',
+        'Clause: "For that, what matters is: [VALUE]."\nPair: material=[VALUE]\nDoes the user want this value? yes, this value matters.',
+        'Clause: "Something in [VALUE] is perfect."\nPair: color=[VALUE]\nDoes the user want this value? yes, this value is wanted.',
+        'Clause: "Yes, [VALUE] is fine."\nPair: color=[VALUE]\nDoes the user want this value? yes, this value is fine.',
     ),
     REJECT: (
-        "I do not want leather.",
-        "Leather is not for me.",
-        "No leather please.",
-        "Avoid black.",
-        "Anything but black.",
-        "I am not looking for wool.",
-        "Without polyester.",
-        "I dislike red.",
-        "Black will not work.",
-        "Please exclude suede.",
-        "I would rather not have cotton.",
-        "Keep it away from nylon.",
+        'Clause: "I do not want [VALUE]."\nPair: material=[VALUE]\nDoes the user want this value? no, the user rejects this value.',
+        'Clause: "[VALUE] is not for me."\nPair: material=[VALUE]\nDoes the user want this value? no, this value is not acceptable.',
+        'Clause: "No [VALUE] please."\nPair: material=[VALUE]\nDoes the user want this value? no, the user does not want this value.',
+        'Clause: "Avoid [VALUE]."\nPair: color=[VALUE]\nDoes the user want this value? no, the user wants to avoid this value.',
+        'Clause: "Anything but [VALUE]."\nPair: color=[VALUE]\nDoes the user want this value? no, any value except this one.',
+        'Clause: "I am not looking for [VALUE]."\nPair: material=[VALUE]\nDoes the user want this value? no, this value is rejected.',
+        'Clause: "Without [VALUE]."\nPair: material=[VALUE]\nDoes the user want this value? no, this value should be excluded.',
+        'Clause: "I dislike [VALUE]."\nPair: color=[VALUE]\nDoes the user want this value? no, the user dislikes this value.',
+        'Clause: "[VALUE] will not work."\nPair: color=[VALUE]\nDoes the user want this value? no, this value will not work.',
+        'Clause: "I would rather not have [VALUE]."\nPair: material=[VALUE]\nDoes the user want this value? no, the user would rather avoid this value.',
     ),
     NEUTRAL: (
-        "I do not have a preference.",
-        "Either is fine with me.",
-        "I am not sure yet.",
-        "Show me some options.",
-        "That does not matter much.",
-        "Use your judgment there.",
-        "Maybe something practical.",
-        "What do you recommend?",
-        "I am open on that.",
-        "No strong opinion.",
+        'Clause: "100% [VALUE]."\nPair: material=[VALUE]\nDoes the user want this value? neutral, this only describes a material.',
+        'Clause: "[VALUE] lining."\nPair: material=[VALUE]\nDoes the user want this value? neutral, this is a descriptive fragment.',
+        'Clause: "95% [VALUE], 5% spandex."\nPair: material=[VALUE]\nDoes the user want this value? neutral, this is product composition text.',
+        'Clause: "Body: [VALUE]."\nPair: material=[VALUE]\nDoes the user want this value? neutral, this only mentions the value.',
+        'Clause: "I do not have a preference."\nPair: material=[VALUE]\nDoes the user want this value? neutral, no preference is expressed.',
+        'Clause: "Either is fine with me."\nPair: color=[VALUE]\nDoes the user want this value? neutral, either option is fine.',
+        'Clause: "I am not sure yet."\nPair: material=[VALUE]\nDoes the user want this value? neutral, the user is undecided.',
+        'Clause: "Show me some options."\nPair: color=[VALUE]\nDoes the user want this value? neutral, the user is asking to browse.',
     ),
 }
 CLAUSE_CLASSES = (ACCEPT, REJECT, NEUTRAL)
-CLAUSE_MIN_SIMILARITY = 0.54
-CLAUSE_MIN_MARGIN = 0.015
+CLAUSE_MIN_SIMILARITY = 0.50
+CLAUSE_MIN_MARGIN = 0.025
 CLAUSE_SPLIT = re.compile(
     r"(?<=[.!?;])\s+|\s+--\s+|\s*,?\s+\b(?:but|however|though|although|except)\b\s+",
     re.I,
@@ -152,6 +147,16 @@ CLAUSE_SPLIT = re.compile(
 class AttributeMention:
     attribute: str
     value: str
+
+
+@dataclass(frozen=True)
+class PreferenceSignal:
+    attribute: str
+    value: str
+    label: str
+    weight: float
+    confidence: float
+    scores: dict[str, float]
 
 
 def extract_values(message: str) -> dict[str, str]:
@@ -185,6 +190,17 @@ def extract_mentions(clause: str) -> list[AttributeMention]:
     if price:
         mentions.append(AttributeMention("budget", price.group(1) or price.group(2)))
     return mentions
+
+
+def relation_text(clause: str, mention: AttributeMention) -> str:
+    """Prompt-shaped text for relation classification around one value."""
+    value_pattern = re.compile(rf"\b{re.escape(mention.value)}\b", re.I)
+    masked = value_pattern.sub("[VALUE]", clause)
+    return (
+        f'Clause: "{masked}"\n'
+        f"Pair: {mention.attribute}=[VALUE]\n"
+        "Does the user want this value?"
+    )
 
 
 class IntentDetector:
@@ -267,19 +283,60 @@ class ClausePreferenceClassifier:
         vector = encoder.encode([clause])[0]
         return self.classify(vector)
 
+    def classify_mention(self, clause: str, mention: AttributeMention, encoder) -> tuple[str, float]:
+        vector = encoder.encode([relation_text(clause, mention)])[0]
+        return self.classify(vector)
+
+    def score_mention(self, clause: str, mention: AttributeMention, encoder) -> PreferenceSignal:
+        vector = encoder.encode([relation_text(clause, mention)])[0]
+        scores = self.class_scores(vector)
+        accept = scores.get(ACCEPT, 0.0)
+        reject = scores.get(REJECT, 0.0)
+        neutral = scores.get(NEUTRAL, 0.0)
+        polarity = accept - reject
+        strength = max(accept, reject) - neutral
+        confidence = max(0.0, min(1.0, abs(polarity) + max(0.0, strength)))
+        if abs(polarity) < CLAUSE_MIN_MARGIN or max(accept, reject) < CLAUSE_MIN_SIMILARITY:
+            label = NEUTRAL
+            weight = 0.0
+        elif polarity < 0:
+            if strength >= CLAUSE_MIN_MARGIN:
+                label = HARD_REJECT
+                weight = -1.0
+            else:
+                label = SOFT_REJECT
+                weight = -0.5
+        elif strength >= CLAUSE_MIN_MARGIN:
+            label = HARD_APPROVE
+            weight = 1.0
+        else:
+            label = SOFT_APPROVE
+            weight = 0.5
+        return PreferenceSignal(
+            mention.attribute,
+            mention.value,
+            label,
+            weight,
+            confidence,
+            scores,
+        )
+
     def classify(self, vector) -> tuple[str, float]:
+        ranked = sorted(self.class_scores(vector).items(), key=lambda kv: -kv[1])
+        if not ranked or ranked[0][1] < CLAUSE_MIN_SIMILARITY:
+            return NEUTRAL, ranked[0][1] if ranked else 0.0
+        if len(ranked) > 1 and ranked[0][1] - ranked[1][1] < CLAUSE_MIN_MARGIN:
+            return NEUTRAL, ranked[0][1]
+        return ranked[0][0], ranked[0][1]
+
+    def class_scores(self, vector) -> dict[str, float]:
         scores = self.matrix @ vector
         best: dict[str, float] = {}
         for label, score in zip(self.labels, scores):
             value = float(score)
             if value > best.get(label, -1.0):
                 best[label] = value
-        ranked = sorted(best.items(), key=lambda kv: -kv[1])
-        if not ranked or ranked[0][1] < CLAUSE_MIN_SIMILARITY:
-            return NEUTRAL, ranked[0][1] if ranked else 0.0
-        if len(ranked) > 1 and ranked[0][1] - ranked[1][1] < CLAUSE_MIN_MARGIN:
-            return NEUTRAL, ranked[0][1]
-        return ranked[0][0], ranked[0][1]
+        return best
 
 
 def _fingerprint() -> str:

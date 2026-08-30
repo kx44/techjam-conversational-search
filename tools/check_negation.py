@@ -12,6 +12,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from starter.agent import Agent
+from starter.intent import HARD_APPROVE, HARD_REJECT, NEUTRAL, SOFT_APPROVE
 from starter.stemmer import stem
 
 
@@ -57,6 +58,12 @@ def main() -> None:
             failures.append(f"{message!r}: rejected term leaked into stem query")
         if rejected_value in " ".join(state["text"]).lower():
             failures.append(f"{message!r}: rejected term leaked into dense text")
+        signal = state["preferences"].get((rejected_attr, rejected_value))
+        if signal is None or signal.label != HARD_REJECT or signal.weight >= 0:
+            failures.append(f"{message!r}: rejected pair lacks a hard negative preference signal")
+        signal = state["preferences"].get((accepted_attr, accepted_value))
+        if signal is None or signal.label == HARD_REJECT or signal.weight < 0:
+            failures.append(f"{message!r}: accepted pair has a negative preference signal")
 
     agent.reset("flip", {})
     state = agent._sessions["flip"]
@@ -76,12 +83,22 @@ def main() -> None:
         failures.append("ambiguous positive: polyester was dropped from positive retrieval")
     if "polyester" in state["rejected"].get("material", set()):
         failures.append("ambiguous positive: polyester was marked rejected")
+    signal = state["preferences"].get(("material", "polyester"))
+    if signal is None or signal.label != HARD_APPROVE or signal.weight <= 0:
+        failures.append("ambiguous positive: polyester lacks a positive preference signal")
 
     agent.reset("unpaired", {})
     state = agent._sessions["unpaired"]
     agent._accumulate(state, "Wrap closure.")
     if "wrap" not in state["plain"] or "closure" not in state["plain"]:
         failures.append("unpaired reject: useful clause text was dropped")
+
+    agent.reset("neutral", {})
+    state = agent._sessions["neutral"]
+    agent._accumulate(state, "100% Polyester.")
+    signal = state["preferences"].get(("material", "polyester"))
+    if signal is None or signal.label != NEUTRAL or signal.weight != 0:
+        failures.append("neutral fragment: polyester composition did not produce a neutral signal")
 
     if failures:
         print("FAIL")

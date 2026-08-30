@@ -69,6 +69,8 @@ QUERY_INSTRUCTION = True    # BGE v1.5 recommends an instruction on queries only
 # midpoint is taken rather than the argmax.
 DENSE_WEIGHT = 0.25
 DENSE_LIMIT = RETRIEVE
+PREFERENCE_TERM_BOOST = 2
+PREFERENCE_DENSE_BOOST = 2
 
 # Reranking. Fusion decides which products are plausible; this decides their
 # order. BM25 runs an OR query, so a product matching two query terms out of
@@ -197,6 +199,8 @@ class Agent:
         self._intents: dict[str, bool] = {}
         self._clause_classifier = None
         self._clause_intents: dict[str, tuple[str, float]] = {}
+        self._mention_intents: dict[tuple[str, str, str], tuple[str, float]] = {}
+        self._mention_signals: dict[tuple[str, str, str], object] = {}
         self._build_index()
         self._load_model()
 
@@ -287,6 +291,40 @@ class Agent:
 
                 cached = NEUTRAL, 0.0
             self._clause_intents[clause] = cached
+        return cached
+
+    def _classify_mention(self, clause: str, mention) -> tuple[str, float]:
+        if self._encoder is None or self._clause_classifier is None:
+            from starter.intent import NEUTRAL
+
+            return NEUTRAL, 0.0
+        key = (clause, mention.attribute, mention.value)
+        cached = self._mention_intents.get(key)
+        if cached is None:
+            try:
+                cached = self._clause_classifier.classify_mention(clause, mention, self._encoder)
+            except Exception:
+                from starter.intent import NEUTRAL
+
+                cached = NEUTRAL, 0.0
+            self._mention_intents[key] = cached
+        return cached
+
+    def _score_mention(self, clause: str, mention):
+        if self._encoder is None or self._clause_classifier is None:
+            from starter.intent import NEUTRAL, PreferenceSignal
+
+            return PreferenceSignal(mention.attribute, mention.value, NEUTRAL, 0.0, 0.0, {})
+        key = (clause, mention.attribute, mention.value)
+        cached = self._mention_signals.get(key)
+        if cached is None:
+            try:
+                cached = self._clause_classifier.score_mention(clause, mention, self._encoder)
+            except Exception:
+                from starter.intent import NEUTRAL, PreferenceSignal
+
+                cached = PreferenceSignal(mention.attribute, mention.value, NEUTRAL, 0.0, 0.0, {})
+            self._mention_signals[key] = cached
         return cached
 
     def _build_index(self) -> None:
@@ -422,7 +460,7 @@ class Agent:
             "seen": set(), "plain": {}, "stems": {},
             "asked": set(), "retired": set(), "last_ask": None, "size": 0,
             "text": [], "budget": None, "suppress": {}, "phrases": set(),
-            "positive_clauses": [], "accepted": {}, "rejected": {},
+            "positive_clauses": [], "accepted": {}, "rejected": {}, "preferences": {},
         }
 
     def _add_positive_clause(self, state: dict, clause: str) -> None:
@@ -457,7 +495,7 @@ class Agent:
                    for mention in mentions):
                 continue
             positive_clauses.append(clause)
-        state["text"] = positive_clauses
+        dense_clauses = list(positive_clauses)
         state["budget"] = None
         for clause in positive_clauses:
             hint = PRICE_HINT.search(clause)
@@ -476,6 +514,17 @@ class Agent:
             state["phrases"].update(f" {a} {b} " for a, b in zip(sequence, sequence[1:]))
             state["phrases"].update(f" {a} {b} {c} "
                                     for a, b, c in zip(sequence, sequence[1:], sequence[2:]))
+        for (attribute, value), signal in state["preferences"].items():
+            if signal.weight <= 0 or value in state["rejected"].get(attribute, set()):
+                continue
+            repeats = max(1, round(signal.weight * PREFERENCE_TERM_BOOST))
+            for term in _terms(value):
+                state["plain"][term] = state["plain"].get(term, 0) + repeats
+            for term in _stemmed(value):
+                state["stems"][term] = state["stems"].get(term, 0) + repeats
+            dense_repeats = max(1, round(signal.weight * PREFERENCE_DENSE_BOOST))
+            dense_clauses.extend(f"{attribute} {value}" for _ in range(dense_repeats))
+        state["text"] = dense_clauses
 
     def _accumulate(self, state: dict, message: str) -> None:
         """Fold one customer turn into the running query.
@@ -504,23 +553,31 @@ class Agent:
             self._add_positive_clause(state, message)
             self._rebuild_positive_state(state)
             return
-        from starter.intent import ACCEPT, NEUTRAL, REJECT, extract_mentions, split_clauses
+        from starter.intent import NEUTRAL, extract_mentions, split_clauses
+        from starter.intent import HARD_APPROVE, HARD_REJECT, SOFT_APPROVE, SOFT_REJECT
 
         for clause in split_clauses(message):
-            verdict, _ = self._classify_clause(clause)
             mentions = extract_mentions(clause)
-            if verdict == REJECT and mentions:
+            if mentions:
+                rejected = False
                 for mention in mentions:
+                    signal = self._score_mention(clause, mention)
+                    state["preferences"][(mention.attribute, mention.value)] = signal
+                    if signal.label != HARD_REJECT:
+                        continue
                     self._remember(state["rejected"], mention.attribute, mention.value)
                     self._forget(state["accepted"], mention.attribute, mention.value)
-                continue
-            if verdict == ACCEPT:
+                    rejected = True
+                if rejected:
+                    continue
                 for mention in mentions:
-                    self._forget(state["rejected"], mention.attribute, mention.value)
-                    self._remember(state["accepted"], mention.attribute, mention.value)
+                    signal = self._score_mention(clause, mention)
+                    if signal.label in (HARD_APPROVE, SOFT_APPROVE, NEUTRAL):
+                        self._forget(state["rejected"], mention.attribute, mention.value)
+                        self._remember(state["accepted"], mention.attribute, mention.value)
                 self._add_positive_clause(state, clause)
                 continue
-            if verdict == NEUTRAL and self._declined(clause):
+            if self._declined(clause):
                 continue
             self._add_positive_clause(state, clause)
         self._rebuild_positive_state(state)
