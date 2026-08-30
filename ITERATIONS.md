@@ -4,7 +4,7 @@ Onboarding notes. What we changed, what worked, what didn't, and what we learned
 about the benchmark along the way. Read the first two sections to be useful; the
 rest is reference.
 
-**Current: `rerank` branch, 0.8922 on the public set**, from a 0.1067 starter
+**Current: `pipeline` branch, 0.8922 on the public set**, from a 0.1067 starter
 baseline. Run it with `python3 -m evaluator.local_evaluator`. Setup is in
 `submission/README.md`; method and limitations in `submission/REPORT.md`.
 
@@ -153,11 +153,11 @@ configurations. Nothing added moves recall; everything only moves MRR.
 
 | branch | what it is |
 |---|---|
-| **`rerank`** | **current. 0.8922 / 0.9389** |
+| **`pipeline`** | **current — the full agent. 0.8922 / 0.9389** |
 | `main` | untouched starter kit, 0.1067 |
 | `bucket-filter` | fitted to the reference simulator. 0.9364 official, 0.4388 natural. **Do not ship** — kept as the cautionary case |
 | `robust-agent` | an independent rebuild assuming an unknown evaluator, 0.8104 / 0.8654 |
-| `ir-classical`, `dense-bge`, `adaptive-cutoff`, `boundary-retry` | intermediate points in the current lineage |
+| `ir-classical`, `dense-bge`, `adaptive-cutoff`, `boundary-retry` | intermediate points in the `pipeline` lineage, each named for the one technique it added |
 | `intent-detector` | WIP. Classification works; no action on it helped |
 
 ## Open
