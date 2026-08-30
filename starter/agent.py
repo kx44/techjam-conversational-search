@@ -49,16 +49,27 @@ DIGITS = re.compile(r"\d")
 # missing artifact must degrade quietly rather than score zero.
 MODEL_DIR = "models/bge-small-en-v1.5"
 EMBEDDINGS = "data/bge_embeddings"
-# Dense product retrieval is off. The embedding model is still loaded - decline
-# detection needs it - but its catalog matrix is not, and the ranking does not
-# take part in fusion. Measured on both harnesses:
-#   model + catalog matrix + prototypes   0.8760 / 0.9263
-#   model + prototypes only               0.8802 / 0.9298   <- shipped
-#   no model at all                       0.8598 / 0.9297
-# Dense retrieval was worth +0.004 before reranking existed and -0.004 after,
-# because the reranker absorbed what it contributed. Dropping the matrix also
-# drops 73 MB and an 18-minute precompute. Set True to re-check.
-USE_DENSE = False
+# Dense product retrieval, on. It was off until tools/shopper_sim.py existed,
+# because the two harnesses available before it both had customers who quote
+# catalog text close to verbatim - the regime where lexical matching is
+# strongest and embeddings have least to add. On a shopper who names things in
+# their own words it is the only change that has ever moved hit rate off its
+# ceiling, 0.935 -> 0.985.
+#
+#   weight   reference  realistic_sim  shopper_sim
+#     0.00      0.8922         0.9389       0.8673
+#     0.25      0.8864         0.9358       0.8778
+#     1.00      0.8864         0.9346       0.9006   <- shipped
+#     2.50      0.8512         0.9236       0.8790
+#
+# The cost is binary rather than proportional: nearly all of it is the step
+# from 0.00 to 0.25, and the reference score is flat from 0.25 to 1.00 while
+# the realistic shopper gains 0.023. So a quarter-weight is strictly dominated
+# - if it runs at all it should run at full voice.
+#
+# Requires data/bge_embeddings.npy (tools/build_embeddings.py, ~18 min). Absent,
+# the agent runs BM25-only and says nothing; check agent._index is not None.
+USE_DENSE = True
 QUERY_INSTRUCTION = True    # BGE v1.5 recommends an instruction on queries only
 # Dense retrieval adds recall and costs precision: at equal weight it raises
 # hit rate but pushes the exact match down the list, because embeddings find
@@ -67,7 +78,7 @@ QUERY_INSTRUCTION = True    # BGE v1.5 recommends an instruction on queries only
 # 0.15 -> .7027/.7864, 0.25 -> .7022/.7857, 0.50 -> .6987/.7883,
 # 1.00 -> .6897/.7690. Anything in 0.15-0.50 is within noise of the others; the
 # midpoint is taken rather than the argmax.
-DENSE_WEIGHT = 0.25
+DENSE_WEIGHT = 1.0
 DENSE_LIMIT = RETRIEVE
 
 # Reranking. Fusion decides which products are plausible; this decides their

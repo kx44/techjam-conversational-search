@@ -1,6 +1,6 @@
 # Method, results and limitations
 
-**Public-set score 0.8922**, from a 0.1067 baseline. No generative model, no
+**Public-set score 0.8864**, from a 0.1067 baseline. No generative model, no
 network, no credentials, no reported token usage. Median 38 ms per turn.
 
 ## Architecture
@@ -14,10 +14,10 @@ customer message
   ├─ ACCUMULATE   skip if identical to an earlier turn; add terms to the
   │               running query
   │
-  ├─ RETRIEVE     two views of one catalog, 500 candidates each
+  ├─ RETRIEVE     three views of one catalog, 500 candidates each
   │                 BM25 over raw tokens                weight 1.00
   │                 BM25 over Porter-stemmed tokens     weight 1.00
-  │                 (dense product retrieval available, off - see Models)
+  │                 BGE-small cosine over 384-d vectors weight 1.00
   │
   ├─ FUSE         weighted Reciprocal Rank Fusion (k=60) -> top 50
   │
@@ -50,7 +50,7 @@ turns asked about attributes that unlocked nothing.
 Reference evaluator, 200 public sessions:
 
 ```
-hit@10 0.965    MRR 0.827    MTTC 2.92    efficiency 0.808    score 0.8922
+hit@10 0.965    MRR 0.798    MTTC 2.78    efficiency 0.822    score 0.8864
 ```
 
 | increment | score | Δ |
@@ -64,16 +64,17 @@ hit@10 0.965    MRR 0.827    MTTC 2.92    efficiency 0.808    score 0.8922
 | + catalog reranking of the fused head | 0.8638 | +0.156 |
 | + declined questions decay back into contention | 0.8760 | +0.012 |
 | + embedding model used for intent only, not retrieval | 0.8802 | +0.004 |
-| + phrases taken from within-message adjacency | **0.8922** | +0.012 |
+| + phrases taken from within-message adjacency | 0.8922 | +0.012 |
+| + dense retrieval re-enabled at equal weight | **0.8864** | −0.006 |
 
 By scenario:
 
 | scenario | n | hit@10 | MRR | MTTC |
 |---|---|---|---|---|
-| browsing | 80 | 0.988 | 0.836 | 2.69 |
-| buying | 80 | 0.950 | 0.796 | 2.39 |
-| intent override | 30 | 1.000 | 0.898 | 3.93 |
-| boundary | 10 | 0.800 | 0.716 | 4.60 |
+| browsing | 80 | 0.988 | 0.824 | 2.59 |
+| buying | 80 | 0.950 | 0.752 | 2.34 |
+| intent override | 30 | 0.967 | 0.868 | 3.60 |
+| boundary | 10 | 0.900 | 0.821 | 3.70 |
 
 ## Models and cost
 
@@ -93,10 +94,10 @@ By scenario:
 The model was bought for retrieval and earns its place in classification
 instead. One encoder serves two consumers needing different artifacts:
 
-| use | artifact | worth |
-|---|---|---|
-| dense product retrieval | 73 MB catalog matrix | **−0.004** |
-| decline detection | 56 KB prototypes | **+0.020** |
+| use | artifact | public set | realistic shopper |
+|---|---|---|---|
+| dense product retrieval | 73 MB catalog matrix | **−0.006** | **+0.033** |
+| decline detection | 56 KB prototypes | **+0.020** | +0.020 |
 
 Encoding the conversation and cosining it against 50,000 product vectors stopped
 paying once reranking existed — the reranker absorbed what it contributed, and
@@ -106,8 +107,28 @@ pays, because nothing else distinguishes a decline from an answer: catalog
 statistics cannot, the rarest new term in a decline having median IDF 1.34
 against a reveal's 1.15, with no usable threshold.
 
-So dense retrieval is off and its matrix is not built, which also removes an
-18-minute precompute. It costs memory, not time: 0.5 s of start-up and 2 ms per
+Dense retrieval was off until a third harness existed, and that reversal is
+worth stating plainly. `tools/realistic_sim.py` and the reference evaluator both
+have customers who quote catalog text close to verbatim - the regime where
+lexical matching is strongest and embeddings add least - so both measured dense
+retrieval as slightly negative. `tools/shopper_sim.py` models a shopper who
+names things in their own words, and there dense retrieval is the only change
+that has ever moved hit rate off its ceiling: 0.935 to 0.985.
+
+| dense weight | reference | realistic_sim | shopper_sim |
+|---|---|---|---|
+| 0.00 | 0.8922 | 0.9389 | 0.8673 |
+| 0.25 | 0.8864 | 0.9358 | 0.8778 |
+| 1.00 | 0.8864 | 0.9346 | **0.9006** |
+| 2.50 | 0.8512 | 0.9236 | 0.8790 |
+
+The cost is binary rather than proportional: nearly all of it is the step from
+0.00 to 0.25, and the reference score is flat from 0.25 to 1.00 while the
+realistic shopper gains 0.023. A quarter weight is therefore strictly dominated.
+We ship it at 1.00, paying 0.006 on the public set - roughly one session in 200,
+inside the noise band we decline to chase elsewhere - for 0.033 on the harness
+that best models a real customer, and for the robustness that buys if the
+private harness paraphrases at all. It costs memory, not time: 0.5 s of start-up and 2 ms per
 turn. It runs under `onnxruntime` on CPU with no PyTorch dependency; the
 exported graph returns `last_hidden_state`, so CLS pooling and L2 normalisation
 are done explicitly (BGE pools CLS, not mean — mean pooling this model produces

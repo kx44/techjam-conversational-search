@@ -27,19 +27,20 @@ degradation path, and needs no install step of any kind.
 
 |  | A: with the embedding model | B: stdlib only |
 |---|---|---|
-| public-set score | **0.8922** | 0.8598 |
-| natural-language harness | **0.9389** | 0.9297 |
+| public-set score | **0.8864** | 0.8598 |
+| natural-language harness | **0.9346** | 0.9297 |
 | boundary sessions | **0.80** hit | 0.60 hit |
 | Python | 3.12 | **3.9+, any** |
 | dependencies | onnxruntime, tokenizers, numpy | **none — stdlib only** |
-| local assets | 128 MB model + 56 KB prototypes | **none** |
+| local assets | 128 MB model + 73 MB matrix + 56 KB prototypes | **none** |
 | agent memory | 577 MB | **328 MB** |
-| setup | download the model, build prototypes (seconds) | **none** |
+| setup | download the model, build prototypes and the catalog matrix (~18 min) | **none** |
 
-The model is used for **intent detection only** — deciding whether a customer
-answered a question or declined it. Dense product retrieval is off by default:
-it measured −0.004 once reranking existed, and turning it off also drops a
-73 MB matrix and an 18-minute precompute. `USE_DENSE = True` re-enables it.
+The model does two jobs: **intent detection** — whether a customer answered a
+question or declined it — and **dense product retrieval**, fused with the two
+BM25 retrievers at equal weight. Dense retrieval was off until a third harness
+existed; see `REPORT.md`. `USE_DENSE = False` disables retrieval while keeping
+intent detection, which drops the 73 MB matrix and its precompute for 0.006.
 
 ## Configuration A — with the embedding model (default)
 
@@ -54,11 +55,12 @@ python3.12 -m venv .venv
 #   onnx/model.onnx (127 MB), tokenizer.json, config.json
 
 .venv/bin/python tools/build_intent_prototypes.py        # seconds, writes 56 KB
+.venv/bin/python tools/build_embeddings.py               # ~18 min, writes 73 MB
 .venv/bin/python -m evaluator.local_evaluator --output results.json
 ```
 
-No catalog embedding step is needed. `tools/build_embeddings.py` is only
-required if you set `USE_DENSE = True`, and takes about 18 minutes.
+If the catalog matrix is absent the agent runs BM25-only and reports nothing —
+check `agent._index is not None` before trusting a null result.
 
 If the model or the prototypes are absent the agent falls back to
 configuration B automatically — it does not fail. Verified: with
@@ -92,10 +94,11 @@ never touches the network.
 ```bash
 python3 -m evaluator.local_evaluator            # reference evaluator
 python3 tools/realistic_sim.py                  # independent natural-language harness
+python3 tools/shopper_sim.py                    # a shopper who talks around the product
 python3 tools/category_harness.py               # category-dependency curve
 python3 tools/build_associations.py --inspect   # a documented negative result
 ```
 
-`tools/realistic_sim.py` shares no code, templates or vocabulary with the
-reference evaluator. Every figure in `REPORT.md` is reproducible from these
+`tools/realistic_sim.py` and `tools/shopper_sim.py` share no code, templates or
+vocabulary with the reference evaluator. Every figure in `REPORT.md` is reproducible from these
 four commands.
