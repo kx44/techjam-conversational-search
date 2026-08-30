@@ -187,7 +187,93 @@ Recorded because the negative results shaped the design.
 | BM25 field weights | unchanged; ten configurations span 0.026 and flat 1.0 everywhere loses only 0.022. Boosting features and details, where the quoted constraint text lives, is worse |
 | catalog-mined synonym expansion | −0.022; polysemy — in a clothing catalog "trainer" means waist trainer |
 | categories-only retriever | −0.001; correlated with a column BM25 already weights |
+| spaCy for negation, modality and attribute structure | see below — evaluated at length, not adopted |
 
 A consistent theme: a feature having information is not sufficient. It must add
 information the stronger features lack, at the resolution where the ranking
 decision is actually made.
+
+
+## Why there is no linguistic parser in the pipeline
+
+A bag of terms cannot express polarity or modality, and the failure is silent
+and in the wrong direction. Asked for `Men's Shoes, must be leather, not
+suede`, the agent puts `suede` in the query as positive evidence and returns
+*PUMA Men's Suede Striped* and *FRYE Men's Phillip Suede Oxford* in the top
+five. The customer's exclusion becomes a recommendation.
+
+spaCy was evaluated for exactly this, plus modality ("must" vs "would be
+nice"), no-preference detection, intent override and attribute extraction,
+inserted before retrieval. It was built, debugged over several iterations,
+measured, and removed.
+
+**It is genuinely good at the core task.** Isolating negation *attachment* -
+which noun does the parser say is negated - gives 82% on single-clause
+utterances, with four of six constructions perfect:
+
+| construction | correct |
+|---|---|
+| `Not suede - I need leather instead.` | 25/25 |
+| `No suede, please.` | 50/50 |
+| `...but avoid suede` | 25/25 |
+| `...without any suede` | 25/25 |
+| `must be leather, not suede` | 79/100 |
+| `Anything but suede` | 0/25 |
+
+**Reading clause by clause fixed the integration.** Parsing whole messages let
+negation leak across coordination - in "not suede, and ideally black", `black`
+is a conjunct of `suede` and was wrongly marked negative - and discarded turns
+that decline one attribute while volunteering another. Per-clause reading fixed
+both, and made the layer harmless on the shipping harnesses where the
+whole-message version had cost −0.005:
+
+| | official | natural language |
+|---|---|---|
+| shipped | 0.8922 | 0.9389 |
+| + clause-scoped negation | 0.8922 | 0.9385 |
+
+**It still fails, because the errors are asymmetric.** Across a naturalness
+gradient holding the conveyed facts constant and varying only the wording:
+
+| customer language | control hit/MRR | with parsing | Δ |
+|---|---|---|---|
+| reference template | 0.435 / 0.326 | 0.435 / 0.326 | +0.000 |
+| reworded frame | 0.461 / 0.331 | 0.461 / 0.331 | +0.000 |
+| plain natural | 0.391 / 0.296 | 0.391 / 0.296 | +0.000 |
+| natural, with polarity | 0.426 / 0.305 | 0.409 / 0.288 | **−0.017** |
+| very natural | 0.443 / 0.325 | 0.417 / 0.318 | **−0.026** |
+
+It gets *worse* as language gets more natural - the opposite of the intended
+effect. On those richer sentences the parse degrades, and when it misattaches
+it does not merely fail to fire, it fires on the wrong noun:
+
+| what the layer does on a negation | share |
+|---|---|
+| drops the true value | **40%** |
+| drops the decoy (correct) | 34% |
+| drops neither | 25% |
+
+The costs are not symmetric. Keeping a decoy adds one noisy term to a query of
+twenty; dropping the true value removes the term that identifies the target. A
+34/40 split is therefore well net negative, which is what the gradient shows.
+
+**A bigger model does not fix it.** `en_core_web_md` scores 76% attachment
+against `sm`'s 82% - it differs only in word vectors, not parser architecture.
+Only `en_core_web_trf` would plausibly clear the bar, at ~400 MB plus PyTorch,
+which exceeds the entire current asset budget for a capability neither harness
+exercises.
+
+**Where a parser would earn its place**: mixed polarity in one utterance,
+mixed modality ("must be waterproof, ideally black, definitely not leather"),
+comparatives, quantities beyond price, and correcting one attribute among
+several. All are compositional - the meaning depends on how the words relate,
+not which are present. The reference simulator emits either a verbatim catalog
+string or one of six fixed templates, and produces none of them: every content
+word it generates is a positive, equal-weight assertion, which is precisely the
+regime where a bag of terms is adequate.
+
+So the representation is matched to this benchmark's language, and would
+degrade silently rather than loudly on language the benchmark does not produce.
+If the private harness paraphrases into anything more conversational, negation
+is the first thing that would bite - and on this evidence a parser is not yet
+the fix.
