@@ -19,8 +19,12 @@ Hits are **exact string equality** on `parent_asin`. No LLM judge. The
 `message` field is never read by the reference evaluator; `usage` tokens are
 reported but excluded from scoring.
 
-**Current: branch `pipeline`, 0.8922 public / 0.9389 on our own simulator.**
-Baseline was 0.1067.
+**Current: branch `constraint-state`, 0.8770 reference.** Baseline was 0.1067.
+
+This branch is `override-retraction` merged with `origin/negation`. Both lines
+maintain a structured model of what the customer currently wants, so they are
+one subsystem, not two - see §11. **The negation logic itself is not settled**;
+what is settled is where it plugs in.
 
 ## 2. Interface (fixed by `docs/agent_api_contract.json`)
 
@@ -81,7 +85,13 @@ nothing.
 ```
 starter/agent.py      the agent
 starter/stemmer.py    vendored Porter stemmer, stdlib
-starter/intent.py     prototype-nearest-neighbour intent classifier
+starter/intent.py     TWO prototype classifiers over one encoder:
+                        IntentDetector            NORMAL/OVERRIDE/NO_PREFERENCE
+                                                  whole message, drives override
+                                                  and decline detection
+                        ClausePreferenceClassifier ACCEPT/REJECT/NEUTRAL per
+                                                  (attribute, value) mention,
+                                                  drives negation
 starter/dense.py      ONNX encoder + optional dense index
 ```
 
@@ -89,9 +99,19 @@ Per turn, `respond()`:
 
 ```
 _accumulate(state, msg)     dedupe on exact text; suppression update;
-                            terms → state["plain"] / ["stems"];
-                            within-message bi/trigrams → state["phrases"];
-                            budget regex → state["budget"]
+                            OVERRIDE? → _retract: record superseded values;
+                            record stated values in state["values"];
+                            split into clauses; per clause:
+                              mentions? → score each (attribute, value) once;
+                                          HARD_REJECT anywhere disqualifies the
+                                          clause and bans the value;
+                                          otherwise the clause is evidence
+                              no mentions and declined? → drop it
+                            _rebuild_positive_state: THE single place that
+                            decides what reaches retrieval - clears and rebuilds
+                            plain / stems / phrases / text / budget from
+                            positive_clauses, dropping rejected clauses and
+                            excising superseded values
 _search("products", ...)    BM25 raw,     RETRIEVE=500
 _search("products_stem",..) BM25 stemmed, RETRIEVE=500
 _fuse(...)                  weighted RRF, RRF_K=60 → list[(pid, score)]
@@ -115,7 +135,12 @@ BM25_WEIGHTS    = "0.0, 6.0, 4.0, 2.5, 2.5, 1.5, 1.0"   # swept, left as found
 ```
 
 Session state keys: `seen, plain, stems, phrases, text, asked, retired,
-last_ask, size, budget, suppress`.
+last_ask, size, budget, suppress`, plus the constraint state added by this
+merge: `positive_clauses, rejected, superseded, values, preferences`.
+
+**`plain`, `stems`, `phrases` and `text` are derived, not accumulated.** They
+are cleared and rebuilt from `positive_clauses` on every turn. Anything that
+edits them directly is erased by the next rebuild - see §11.
 
 Index state: `_doc` (stemmed text per product, space-padded for word-boundary
 `" term "` tests), `_pop` (`log1p(rating_number)`), `_price`, `_df` (IDF cache),
@@ -183,7 +208,7 @@ median 279, scoring 0.18 of the spread below rank 100). Recall@500 ≈ 86%.
 | adaptive score-gap cutoffs (3 variants) | −0.004..−0.019 | RRF already discounts deep ranks; plain depth beats every cutoff rule |
 | CombSUM over normalised scores | −0.006 | rank order more robust across incomparable score scales |
 | dense retrieval at weight ≥0.5 | −0.014 | finds the right *kind* of product, cannot pick which |
-| acting on OVERRIDE (3 variants) | −0.044, 0.000, −0.017 | this evaluator's "earlier preference" is a decoy; decaying evidence discards genuine constraints |
+| acting on OVERRIDE, as blanket decay / attribute retirement / term suppression | −0.044, 0.000, −0.017 | this evaluator's "earlier preference" is a decoy; decaying evidence discards genuine constraints. **Superseded by the same-attribute rule now shipped** — see §11 |
 | title match / title-phrase | −0.004..−0.019 | double-counts what `phrase` already reads (`_doc` includes the title) |
 | categories-only retriever | −0.001 | correlated with a column BM25 already weights 4.0 |
 | BM25 field-weight retuning | 0.000 | 10 configs span 0.026; flat 1.0 loses only 0.022; boosting `features`/`details` is *worse* |
@@ -238,3 +263,57 @@ headroom ≈ 0.02–0.04, mostly MRR at ranks 2–9.
 - boundary is the weakest scenario, hit 0.800 vs 0.965 overall, n=10
 - capabilities that are real but invisible to this benchmark: negation
   handling, genuine intent-override handling, conversation quality
+
+## 11. Constraint state (the merge)
+
+`constraint-state` = `override-retraction` + `origin/negation`. Negation,
+override and retraction are the same subsystem: writes to one structured model
+of what the customer currently wants.
+
+```
+state["values"]      attribute -> everything stated       (so _retract knows
+                                                           what to supersede)
+state["rejected"]    attribute -> ruled out               (negation)
+state["superseded"]  attribute -> replaced by a later turn (override)
+state["preferences"] (attribute, value) -> PreferenceSignal, boosts the query
+state["positive_clauses"]  the evidence the query is rebuilt from
+```
+
+**The one invariant that matters.** `_rebuild_positive_state` is the single
+place that decides what reaches retrieval. It clears `plain`, `stems`,
+`phrases` and `text` and rebuilds them from `positive_clauses` every turn. So
+**a constraint must be state that the rebuild consults, never an edit applied
+to the query.**
+
+This was the entire difficulty of the merge. `override-retraction` originally
+implemented retraction as `_drop_terms`, deleting the stale value out of those
+four structures in place. Against a rebuild that is erased on the next turn:
+the retraction appears to work on the turn it happens and silently stops
+afterwards. It now records `state["superseded"]` and `_strip()` excises those
+values *during* the rebuild, which is idempotent.
+
+Excision rather than dropping the clause, because the clause carries the
+category anchor and that anchor is worth 0.22 (§8) - far more than a stale
+value costs.
+
+### Not yet decided: the negation logic
+
+The classifier merged from `origin/negation` abstains on most real negations.
+`nothing in silver` scores REJECT 0.924 against ACCEPT 0.910 - the right class
+wins, but by 0.0143 against `CLAUSE_MIN_MARGIN = 0.025`, so the verdict is
+UNKNOWN and the value stays in the query.
+
+The cause is `relation_text()`. Every prototype and every query share the same
+scaffold (`Clause: "..."\nPair: color=[VALUE]\nDoes the user want this
+value?`), plus the prototypes carry a trailing answer the query never has. The
+boilerplate dominates the embedding, all similarities pile up at 0.89-0.99, and
+the discriminative signal is worth ~0.01-0.05 of margin.
+
+| option | cost |
+|---|---|
+| `CLAUSE_MIN_MARGIN = 0.010` | one character; unblocks the common cases, leaves the signal compressed |
+| drop the scaffold, mask into the natural clause | prototypes and queries become ordinary English; separates at 0.85-1.00 vs 0.65 |
+| port the two-layer parser from `backupnegation` | cue-and-scope + pair-anchored relation, open- and closed-vocabulary both covered |
+
+**The plug-in point is settled and none of these change it**: whatever decides
+a rejection writes `state["rejected"]`, and the rebuild does the rest.

@@ -236,8 +236,6 @@ class Agent:
         self._intents: dict[str, bool] = {}
         self._overrides: dict[str, bool] = {}
         self._clause_classifier = None
-        self._clause_intents: dict[str, tuple[str, float]] = {}
-        self._mention_intents: dict[tuple[str, str, str], tuple[str, float]] = {}
         self._mention_signals: dict[tuple[str, str, str], object] = {}
         self._build_index()
         self._load_model()
@@ -314,39 +312,6 @@ class Agent:
             return self._index.search(vector, limit)
         except Exception:
             return []
-
-    def _classify_clause(self, clause: str) -> tuple[str, float]:
-        if self._encoder is None or self._clause_classifier is None:
-            from starter.intent import NEUTRAL
-
-            return NEUTRAL, 0.0
-        cached = self._clause_intents.get(clause)
-        if cached is None:
-            try:
-                cached = self._clause_classifier.classify_clause(clause, self._encoder)
-            except Exception:
-                from starter.intent import NEUTRAL
-
-                cached = NEUTRAL, 0.0
-            self._clause_intents[clause] = cached
-        return cached
-
-    def _classify_mention(self, clause: str, mention) -> tuple[str, float]:
-        if self._encoder is None or self._clause_classifier is None:
-            from starter.intent import NEUTRAL
-
-            return NEUTRAL, 0.0
-        key = (clause, mention.attribute, mention.value)
-        cached = self._mention_intents.get(key)
-        if cached is None:
-            try:
-                cached = self._clause_classifier.classify_mention(clause, mention, self._encoder)
-            except Exception:
-                from starter.intent import NEUTRAL
-
-                cached = NEUTRAL, 0.0
-            self._mention_intents[key] = cached
-        return cached
 
     def _score_mention(self, clause: str, mention):
         if self._encoder is None or self._clause_classifier is None:
@@ -498,7 +463,12 @@ class Agent:
             "seen": set(), "plain": {}, "stems": {},
             "asked": set(), "retired": set(), "last_ask": None, "size": 0,
             "text": [], "budget": None, "suppress": {}, "phrases": set(),
-            "positive_clauses": [], "accepted": {}, "rejected": {}, "preferences": {},
+            # Constraint state. Three maps, three jobs, all attribute -> values:
+            #   rejected    the customer ruled it out            (negation)
+            #   superseded  a later turn replaced it             (override)
+            #   values      everything stated, so `_retract` knows what to
+            #               supersede when a new value arrives for an attribute
+            "positive_clauses": [], "rejected": {}, "preferences": {},
             "values": {}, "superseded": {},
         }
 
@@ -649,28 +619,30 @@ class Agent:
             self._add_positive_clause(state, message)
             self._rebuild_positive_state(state)
             return
-        from starter.intent import NEUTRAL, extract_mentions, split_clauses
-        from starter.intent import HARD_APPROVE, HARD_REJECT, SOFT_APPROVE, SOFT_REJECT
+        from starter.intent import (HARD_APPROVE, HARD_REJECT, NEUTRAL, SOFT_APPROVE,
+                                    extract_mentions, split_clauses)
 
         for clause in split_clauses(message):
             mentions = extract_mentions(clause)
             if mentions:
-                rejected = False
-                for mention in mentions:
-                    signal = self._score_mention(clause, mention)
+                # Score each mention once. The verdict is read twice - a
+                # rejection anywhere disqualifies the whole clause as evidence,
+                # and only a clause that survives that can approve anything -
+                # but scoring twice invited the two passes to drift apart.
+                signals = [(m, self._score_mention(clause, m)) for m in mentions]
+                for mention, signal in signals:
                     state["preferences"][(mention.attribute, mention.value)] = signal
-                    if signal.label != HARD_REJECT:
-                        continue
-                    self._remember(state["rejected"], mention.attribute, mention.value)
-                    self._forget(state["accepted"], mention.attribute, mention.value)
-                    rejected = True
-                if rejected:
+                if any(signal.label == HARD_REJECT for _, signal in signals):
+                    for mention, signal in signals:
+                        if signal.label == HARD_REJECT:
+                            self._remember(state["rejected"],
+                                           mention.attribute, mention.value)
                     continue
-                for mention in mentions:
-                    signal = self._score_mention(clause, mention)
+                for mention, signal in signals:
                     if signal.label in (HARD_APPROVE, SOFT_APPROVE, NEUTRAL):
+                        # Stating a value plainly takes back an earlier ban on
+                        # it, the same way it takes back a supersession.
                         self._forget(state["rejected"], mention.attribute, mention.value)
-                        self._remember(state["accepted"], mention.attribute, mention.value)
                 self._add_positive_clause(state, clause)
                 continue
             if self._declined(clause):

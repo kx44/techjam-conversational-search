@@ -4,7 +4,7 @@ Onboarding notes. What we changed, what worked, what didn't, and what we learned
 about the benchmark along the way. Read the first two sections to be useful; the
 rest is reference.
 
-**Current: `pipeline` branch, 0.8922 on the public set**, from a 0.1067 starter
+**Current: `constraint-state` branch, 0.8770 on the public set**, from a 0.1067 starter
 baseline. Run it with `python3 -m evaluator.local_evaluator`. Setup is in
 `submission/README.md`; method and limitations in `submission/REPORT.md`.
 
