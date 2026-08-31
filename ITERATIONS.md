@@ -173,8 +173,7 @@ configurations. Nothing added moves recall; everything only moves MRR.
 |---|---|
 | `tools/realistic_sim.py` | a customer simulator written from scratch — no shared code, templates or vocabulary with the reference evaluator. Paraphrases metadata instead of quoting it, answers whichever topic was raised, volunteers information, corrects itself. **Use this on anything you change** |
 | `tools/category_harness.py` | degrades the category anchor in six graduated steps and reports the curve |
-| `tools/build_associations.py` | the PMI synonym miner, kept as a documented negative result; `--inspect` reproduces both failure modes |
-| `tools/build_intent_prototypes.py` | builds the 56 KB prototype file the classifier needs |
+| `starter/intent.py` | stores the BGE prototype sentences used for no-preference, override and clause-level preference detection; they are embedded at startup |
 | `tools/build_embeddings.py` | catalog embedding matrix — only needed if you set `USE_DENSE = True` |
 | `tools/check_dense.py` | verifies the encoder itself: unit norms, CLS-vs-mean pooling, paraphrase neighbours |
 
@@ -191,9 +190,9 @@ configurations. Nothing added moves recall; everything only moves MRR.
 
 ## Open
 
-- **Team contributions** for `submission/REPORT.md` — not written
-- **Configuration choice**: ship with the model (0.8922, 128 MB, Python 3.12) or
-  stdlib-only (0.8598, runs anywhere). Both documented, fallback is automatic
+- **Configuration choice**: ship with the model (0.8894 public score, 128 MB
+  model + 73 MB dense matrix, Python 3.12) or stdlib-only (0.8598, runs
+  anywhere). Both documented, fallback is automatic
 - **Boundary** is the weakest scenario at hit 0.800 against 0.965 overall, on 10
   sessions
 - Remaining headroom is ~0.02–0.04 and the last several ideas all measured

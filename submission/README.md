@@ -27,34 +27,36 @@ degradation path, and needs no install step of any kind.
 
 |  | A: with the embedding model | B: stdlib only |
 |---|---|---|
-| public-set score | **0.8864** | 0.8598 |
+| public-set score | **0.8894** | 0.8598 |
 | natural-language harness | **0.9346** | 0.9297 |
 | boundary sessions | **0.80** hit | 0.60 hit |
-| Python | 3.12 | **3.9+, any** |
+| Python | **verified on 3.13.5**; 3.12+ recommended | **3.9+, any** |
 | dependencies | onnxruntime, tokenizers, numpy | **none — stdlib only** |
-| local assets | 128 MB model + 73 MB matrix + 56 KB prototypes | **none** |
+| local assets | 128 MB model + 73 MB matrix | **none** |
 | agent memory | 577 MB | **328 MB** |
-| setup | download the model, build prototypes and the catalog matrix (~18 min) | **none** |
+| setup | download the model and build the catalog matrix (~18 min) | **none** |
 
-The model does two jobs: **intent detection** — whether a customer answered a
-question or declined it — and **dense product retrieval**, fused with the two
-BM25 retrievers at equal weight. Dense retrieval was off until a third harness
-existed; see `REPORT.md`. `USE_DENSE = False` disables retrieval while keeping
-intent detection, which drops the 73 MB matrix and its precompute for 0.006.
+The model does two jobs: **intent/state detection** — no preference, override,
+and clause-level accept/reject signals — and **dense product retrieval**. Dense
+retrieval is conditional: it keeps full weight for short/paraphrased requests
+and is down-weighted when the raw and stemmed lexical routes already agree. See
+`REPORT.md` for the measured trade-off. `USE_DENSE = False` disables product
+dense retrieval while keeping BGE state detection, which drops the 73 MB matrix
+and its precompute.
 
 ## Configuration A — with the embedding model (default)
 
-**Python 3.12 required** (onnxruntime publishes no wheel for the system 3.9 on
-this platform).
+**Python 3.13.5 verified locally.** Python 3.12+ is recommended because the
+BGE path depends on `onnxruntime`; Python 3.9 works only for the stdlib fallback
+unless compatible wheels are available on the judging machine.
 
 ```bash
-python3.12 -m venv .venv
+python3.13 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 
-# model: 3 files from BAAI/bge-small-en-v1.5 into models/bge-small-en-v1.5/
-#   onnx/model.onnx (127 MB), tokenizer.json, config.json
+# model: files from BAAI/bge-small-en-v1.5 into models/bge-small-en-v1.5/
+#   onnx/model.onnx (127 MB), tokenizer.json
 
-.venv/bin/python tools/build_intent_prototypes.py        # seconds, writes 56 KB
 .venv/bin/python tools/build_embeddings.py               # ~18 min, writes 73 MB
 .venv/bin/python -m evaluator.local_evaluator --output results.json
 ```
@@ -62,9 +64,9 @@ python3.12 -m venv .venv
 If the catalog matrix is absent the agent runs BM25-only and reports nothing —
 check `agent._index is not None` before trusting a null result.
 
-If the model or the prototypes are absent the agent falls back to
-configuration B automatically — it does not fail. Verified: with
-`models/` removed it scores exactly 0.8598 with zero exceptions.
+If the model is absent the agent falls back to configuration B automatically —
+it does not fail. Verified: with `models/` removed it scores exactly 0.8598
+with zero exceptions.
 
 ## Configuration B — stdlib only
 
@@ -96,9 +98,8 @@ python3 -m evaluator.local_evaluator            # reference evaluator
 python3 tools/realistic_sim.py                  # independent natural-language harness
 python3 tools/shopper_sim.py                    # a shopper who talks around the product
 python3 tools/category_harness.py               # category-dependency curve
-python3 tools/build_associations.py --inspect   # a documented negative result
 ```
 
 `tools/realistic_sim.py` and `tools/shopper_sim.py` share no code, templates or
-vocabulary with the reference evaluator. Every figure in `REPORT.md` is reproducible from these
-four commands.
+vocabulary with the reference evaluator. The robustness figures in `REPORT.md`
+are reproducible from these commands.

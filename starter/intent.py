@@ -100,6 +100,9 @@ PRIORITY = (OVERRIDE, NO_PREFERENCE, NORMAL)
 # Shopper preference clauses are shorter and more local than whole-turn intent.
 # Classify the relation around one masked attribute value at a time so the
 # material word itself cannot dominate the BGE comparison.
+# The prototypes intentionally include positive, negative and catalog-fragment
+# phrasings. The neutral class protects cases like "100% polyester" from being
+# read as either a preference or a rejection.
 CLAUSE_PROTOTYPES: dict[str, tuple[str, ...]] = {
     ACCEPT: (
         'Clause: "I like [VALUE]."\nPair: color=[VALUE]\nDoes the user want this value? yes, the user wants this value.',
@@ -142,6 +145,10 @@ CLAUSE_PROTOTYPES: dict[str, tuple[str, ...]] = {
 CLAUSE_CLASSES = (ACCEPT, REJECT, NEUTRAL)
 CLAUSE_MIN_SIMILARITY = 0.50
 CLAUSE_MIN_MARGIN = 0.025
+# Preference turns often contain two different opinions in one sentence:
+# "I like black, but leather isn't for me". Split just enough to localise the
+# relation, including comma-before-negation cases, while preserving idioms like
+# "anything but leather" as one reject clause.
 CLAUSE_SPLIT = re.compile(
     r"(?<=[.!?;])\s+|\s+--\s+"
     r"|\s*,\s+(?=(?:definitely|defintely|not|no|avoid|without|never|dont|don't|cant|can't|cannot|skip)\b)"
@@ -167,7 +174,12 @@ class PreferenceSignal:
 
 
 def extract_values(message: str) -> dict[str, str]:
-    """Attribute values stated in one message."""
+    """Attribute values stated in one message.
+
+    This lightweight extractor is deliberately small and deterministic. It is
+    used for same-attribute override bookkeeping; broader free-text terms still
+    flow through the lexical query state.
+    """
     tokens = set(WORD.findall(message.lower()))
     found: dict[str, str] = {}
     for attribute, vocabulary in ATTRIBUTE_VALUES.items():
@@ -186,7 +198,11 @@ def split_clauses(message: str) -> list[str]:
 
 
 def extract_mentions(clause: str) -> list[AttributeMention]:
-    """Known product attribute values stated inside one clause."""
+    """Known product attribute values stated inside one clause.
+
+    Mentions are paired with their attribute before classification, so
+    "black" is scored as color=black and "leather" as material=leather.
+    """
     tokens = set(WORD.findall(clause.lower()))
     mentions: list[AttributeMention] = []
     for attribute, vocabulary in ATTRIBUTE_VALUES.items():
@@ -203,6 +219,9 @@ def relation_text(clause: str, mention: AttributeMention) -> str:
     """Prompt-shaped text for relation classification around one value."""
     value_pattern = re.compile(rf"\b{re.escape(mention.value)}\b", re.I)
     masked = value_pattern.sub("[VALUE]", clause)
+    # Masking makes BGE focus on the surrounding relation words ("not",
+    # "prefer", "works") instead of over-associating the bare value token with
+    # a prototype class.
     return (
         f'Clause: "{masked}"\n'
         f"Pair: {mention.attribute}=[VALUE]\n"
@@ -295,11 +314,21 @@ class ClausePreferenceClassifier:
         return self.classify(vector)
 
     def score_mention(self, clause: str, mention: AttributeMention, encoder) -> PreferenceSignal:
+        """Return a signed preference signal for one detected pair.
+
+        The raw nearest-prototype scores are converted into a five-level scale:
+        hard reject, soft reject, neutral, soft approve, hard approve. Retrieval
+        later treats only positive weights as boostable evidence and blocks hard
+        rejected values from entering the positive query.
+        """
         vector = encoder.encode([relation_text(clause, mention)])[0]
         scores = self.class_scores(vector)
         accept = scores.get(ACCEPT, 0.0)
         reject = scores.get(REJECT, 0.0)
         neutral = scores.get(NEUTRAL, 0.0)
+        # Polarity says direction; strength says whether accept/reject is
+        # clearly stronger than neutral. This keeps descriptive product text
+        # from becoming a false preference.
         polarity = accept - reject
         strength = max(accept, reject) - neutral
         confidence = max(0.0, min(1.0, abs(polarity) + max(0.0, strength)))

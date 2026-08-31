@@ -257,9 +257,9 @@ headroom ≈ 0.02–0.04, mostly MRR at ranks 2–9.
 
 ## 10. Open
 
-- team contributions for `submission/REPORT.md` — unwritten
-- config choice: model (0.8922, 128 MB, Python 3.12) vs stdlib-only (0.8598,
-  runs anywhere); both documented, fallback automatic
+- config choice: model (0.8894 public score, 128 MB model + 73 MB dense matrix,
+  Python 3.12) vs stdlib-only (0.8598, runs anywhere); both documented,
+  fallback automatic
 - boundary is the weakest scenario, hit 0.800 vs 0.965 overall, n=10
 - capabilities that are real but invisible to this benchmark: negation
   handling, genuine intent-override handling, conversation quality

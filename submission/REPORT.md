@@ -1,6 +1,6 @@
 # Method, results and limitations
 
-**Public-set score 0.8864**, from a 0.1067 baseline. No generative model, no
+**Public-set score 0.8894**, from a 0.1067 baseline. No generative model, no
 network, no credentials, no reported token usage. Median 38 ms per turn.
 
 ## Architecture
@@ -18,8 +18,9 @@ customer message
   │                 BM25 over raw tokens                weight 1.00
   │                 BM25 over Porter-stemmed tokens     weight 1.00
   │                 BGE-small cosine over 384-d vectors weight 1.00
+  │                 or 0.15 when lexical routes already agree
   │
-  ├─ FUSE         weighted Reciprocal Rank Fusion (k=60) -> top 50
+  ├─ FUSE         weighted Reciprocal Rank Fusion (k=60) -> top 100
   │
   ├─ RERANK       score those 50 on catalog evidence the OR query discards
   │                 phrase      0.8   query bigrams surviving in product text
@@ -50,7 +51,7 @@ turns asked about attributes that unlocked nothing.
 Reference evaluator, 200 public sessions:
 
 ```
-hit@10 0.965    MRR 0.798    MTTC 2.78    efficiency 0.822    score 0.8864
+hit@10 0.985    MRR 0.759054    MTTC 2.54    efficiency 0.846    score 0.889416
 ```
 
 | increment | score | Δ |
@@ -65,23 +66,23 @@ hit@10 0.965    MRR 0.798    MTTC 2.78    efficiency 0.822    score 0.8864
 | + declined questions decay back into contention | 0.8760 | +0.012 |
 | + embedding model used for intent only, not retrieval | 0.8802 | +0.004 |
 | + phrases taken from within-message adjacency | 0.8922 | +0.012 |
-| + dense retrieval re-enabled at equal weight | **0.8864** | −0.006 |
+| + dense retrieval re-enabled conditionally | **0.8894** | −0.003 |
 
 By scenario:
 
 | scenario | n | hit@10 | MRR | MTTC |
 |---|---|---|---|---|
-| browsing | 80 | 0.988 | 0.824 | 2.59 |
-| buying | 80 | 0.950 | 0.752 | 2.34 |
-| intent override | 30 | 0.967 | 0.868 | 3.60 |
-| boundary | 10 | 0.900 | 0.821 | 3.70 |
+| browsing | 80 | 1.000 | 0.718 | 2.35 |
+| buying | 80 | 0.975 | 0.753 | 1.90 |
+| intent override | 30 | 1.000 | 0.881 | 4.00 |
+| boundary | 10 | 0.900 | 0.767 | 4.80 |
 
 ## Models and cost
 
 | | |
 |---|---|
 | generative model | **none** |
-| embedding model | BAAI/bge-small-en-v1.5, 33M params, ONNX on CPU — **intent detection only** |
+| embedding model | BAAI/bge-small-en-v1.5, 33M params, ONNX on CPU — **state detection plus conditional dense retrieval** |
 | API calls | **zero** |
 | reported token usage | 0 prompt, 0 completion |
 | estimated model cost | **$0.00** |
@@ -89,15 +90,15 @@ By scenario:
 | index build | 18.2 s, of which 17.7 s is the two FTS5 indexes |
 | query encoding | 2 ms/turn |
 | agent memory | 328 MB stdlib-only, 577 MB with the model |
-| local assets | 128 MB model + 56 KB prototypes |
+| local assets | 128 MB model + 73 MB dense matrix |
 
 The model was bought for retrieval and earns its place in classification
 instead. One encoder serves two consumers needing different artifacts:
 
 | use | artifact | public set | realistic shopper |
 |---|---|---|---|
-| dense product retrieval | 73 MB catalog matrix | **−0.006** | **+0.033** |
-| decline detection | 56 KB prototypes | **+0.020** | +0.020 |
+| dense product retrieval | 73 MB catalog matrix | **−0.003** | **+0.033** |
+| state / preference detection | prototype sentences in code, embedded at startup | **+0.020** | +0.020 |
 
 Encoding the conversation and cosining it against 50,000 product vectors stopped
 paying once reranking existed — the reranker absorbed what it contributed, and

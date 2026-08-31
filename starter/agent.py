@@ -79,6 +79,10 @@ QUERY_INSTRUCTION = True    # BGE v1.5 recommends an instruction on queries only
 # 1.00 -> .6897/.7690. Anything in 0.15-0.50 is within noise of the others; the
 # midpoint is taken rather than the argmax.
 DENSE_WEIGHT = 1.0
+# Dense is a complement, not a final authority. When lexical routes agree, BGE
+# is down-weighted so exact catalog matches stay in charge. When the user gives
+# a short or paraphrased request, BGE keeps full weight to backfill candidates
+# BM25 may miss.
 DENSE_LEXICAL_WEIGHT = 0.15
 DENSE_PARAPHRASE_WEIGHT = 1.0
 DENSE_LEXICAL_OVERLAP = 0.25
@@ -125,6 +129,10 @@ RERANK_WEIGHTS = {
     "popularity": 0.2,  # targets are real purchases, so common items are likelier
     "price": 0.3,       # only applies once the customer names a budget
 }
+# If all retrieval routes strongly agree on a candidate, but the phrase-heavy
+# reranker pushes it out of sight, rescue it into the visible list. This keeps
+# semantic help narrow: dense can confirm a lexical match, but cannot overrule
+# BM25 on its own.
 SEMANTIC_RESCUE_INSERT = 5      # zero-based; rescue to visible rank 6
 SEMANTIC_RESCUE_FUSED_MAX = 2   # zero-based; fused top 3 only
 SEMANTIC_RESCUE_LEXICAL_MAX = 2 # zero-based; raw+stem top 3 only
@@ -172,6 +180,9 @@ FLAT_ORDER = ("feature", "style", "material", "color", "use_case", "size",
 OVERGENERAL_TERMS = 4
 LOW_ROUTE_OVERLAP = 0.12
 TOP_OVERLAP = 20
+# Flat fused scores mean the top candidates are hard to distinguish. In that
+# situation retrieval is usually waiting for one more discriminating detail, so
+# the dialogue policy switches into `flat` mode and asks sharper questions.
 FLAT_POOL_SPREAD = 0.27
 FLAT_POOL_VARIANCE = 0.000007
 
@@ -228,15 +239,15 @@ def _stemmed(text: str) -> list[str]:
 
 
 class Agent:
-    """BM25 baseline with three classical IR additions and nothing else.
+    """Deterministic conversational search pipeline.
 
-    1. Porter stemming, as a second index, so inflected forms match.
-    2. RM3 pseudo-relevance feedback, to expand short or vague queries.
-    3. Reciprocal Rank Fusion over the three resulting rankings, which needs
-       no weight calibration - only rank order.
+    The agent keeps an explicit constraint state, masks rejected values before
+    retrieval, combines raw BM25, stemmed BM25 and optional BGE dense retrieval,
+    then reranks the fused pool with lightweight catalog evidence.
 
-    Session handling, output shape and clarification behaviour are unchanged
-    from the starter baseline so the retrieval change can be measured alone.
+    Everything is local and deterministic after model embeddings are loaded:
+    no LLM call is made at response time, and the output shape stays compatible
+    with the evaluator contract.
     """
 
     def __init__(self, catalog_path: str | Path = "data/catalog.jsonl") -> None:
@@ -263,9 +274,10 @@ class Agent:
         """Attach whichever model-backed parts have their artifacts present.
 
         The two consumers need different files and are loaded independently:
-        product retrieval needs the 73 MB catalog matrix, decline detection
-        needs only the 56 KB prototypes. Coupling them cost the detector
-        whenever the matrix was absent, which is the cheaper artifact to skip.
+        product retrieval needs the 73 MB catalog matrix, while state and
+        preference detection can build its small prototype matrix directly from
+        sentences in starter.intent. Coupling them cost the detector whenever
+        the catalog matrix was absent, which is the cheaper artifact to skip.
         """
         try:
             from starter.dense import Encoder
@@ -321,6 +333,11 @@ class Agent:
         return cached
 
     def _dense_ranking(self, text: str, limit: int) -> list[str]:
+        """Dense route: retrieve semantically similar products using BGE.
+
+        This is allowed to fail closed. If the local model/index is missing,
+        the rest of the pipeline still works with the two lexical routes.
+        """
         if self._encoder is None or self._index is None or not text.strip():
             return []
         try:
@@ -333,6 +350,7 @@ class Agent:
             return []
 
     def _score_mention(self, clause: str, mention):
+        """Classify one clause/value pair as approve, reject, or neutral."""
         if self._encoder is None or self._clause_classifier is None:
             from starter.intent import NEUTRAL, PreferenceSignal
 
@@ -350,6 +368,7 @@ class Agent:
         return cached
 
     def _build_index(self) -> None:
+        """Build raw and stemmed FTS indexes plus small reranking side tables."""
         cursor = self.connection.cursor()
         for table in ("products", "products_stem"):
             cursor.execute(
@@ -391,6 +410,7 @@ class Agent:
     # ------------------------------------------------------------- retrieval
 
     def _search(self, table: str, terms: list[str], limit: int) -> list[str]:
+        """Run one lexical route over either the raw or stemmed FTS table."""
         unique = list(dict.fromkeys(terms))[:40]
         if not unique:
             return []
@@ -461,6 +481,10 @@ class Agent:
         route_ranks = state.get("route_ranks", {})
         fused_ranks = {pid: rank for rank, (pid, _) in enumerate(head)}
         rescues: list[tuple[int, str]] = []
+        # Rescue only candidates with simultaneous lexical+dense agreement.
+        # This fixes cases like "Chinese New Year" where fusion is confident
+        # but phrase reranking is overly harsh, while avoiding broad semantic
+        # promotion of merely similar products.
         for pid in reordered[top_k:]:
             ranks = route_ranks.get(pid, {})
             if (
@@ -496,6 +520,9 @@ class Agent:
         self._sessions[session_id] = {
             "seen": set(), "plain": {}, "stems": {},
             "asked": set(), "retired": set(), "last_ask": None, "size": 0,
+            # plain/stems/text are rebuilt after every turn from accepted
+            # evidence only. Rejected and superseded values remain in state,
+            # but never leak into positive retrieval terms.
             "text": [], "budget": None, "suppress": {}, "phrases": set(),
             # Constraint state. Three maps, three jobs, all attribute -> values:
             #   rejected    the customer ruled it out            (negation)
@@ -570,6 +597,7 @@ class Agent:
         return pattern.sub(" ", clause)
 
     def _rebuild_positive_state(self, state: dict) -> None:
+        """Materialize retrieval inputs from the current constraint state."""
         state["plain"].clear()
         state["stems"].clear()
         state["phrases"].clear()
@@ -708,7 +736,13 @@ class Agent:
 
     def _diagnose(self, state: dict, rankings: list[tuple[list[str], float]],
                   fused: list[tuple[str, float]]) -> dict:
-        """Cheap uncertainty signals for question policy, not ranking."""
+        """Cheap uncertainty signals for question policy, not ranking.
+
+        `route_overlap` captures disagreement across retrieval routes.
+        `flat_pool` captures a diffuse candidate set where many top products
+        have nearly equal fused scores. Both signals help decide whether to
+        ask broad exploratory questions or sharper constraint questions.
+        """
         active = [ranking for ranking, _ in rankings if ranking]
         overlaps = []
         for index, left in enumerate(active):
@@ -805,6 +839,7 @@ class Agent:
         turn: int,
         top_k: int,
     ) -> dict:
+        """Main turn entry point used by the evaluator/API."""
         state = self._sessions.get(session_id)
         if state is None:
             raise RuntimeError("reset must be called before respond")
@@ -825,6 +860,8 @@ class Agent:
         dense_ranking = self._dense_ranking(" ".join(state["text"]), DENSE_LIMIT) if USE_DENSE else []
         dense_weight = self._dense_weight(state, raw_ranking, stemmed_ranking) if dense_ranking else 0.0
         state["dense_weight"] = dense_weight
+        # Three active routes: exact lexical, stemmed lexical, and semantic.
+        # RRF uses only rank order, so the route weights matter only by ratio.
         rankings = [
             (raw_ranking, 1.0),
             (stemmed_ranking, 1.0),
@@ -838,6 +875,7 @@ class Agent:
             )
             rankings.append((expansion_ranking, 1.0))
         route_ranks: dict[str, dict[str, int]] = {}
+        # Keep per-route positions for diagnostics and the guarded rescue.
         for name, ranking in (("raw", raw_ranking), ("stem", stemmed_ranking),
                               ("dense", dense_ranking)):
             for rank, pid in enumerate(ranking[:RERANK_DEPTH]):

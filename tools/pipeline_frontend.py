@@ -35,18 +35,18 @@ FIXED_SHOPPER_SAMPLE = {
 }
 
 PUBLIC_DEV_SCORECARD = {
-    "technical_score": 0.864806,
-    "hit_rate_at_10": 0.95,
-    "mrr": 0.734020,
-    "mttc": 2.52,
-    "note": "200 sessions",
+    "technical_score": 0.889416,
+    "hit_rate_at_10": 0.985,
+    "mrr": 0.759054,
+    "mttc": 2.54,
+    "note": "200 sessions, dense on + BGE state on",
 }
 SYNTHETIC_ROBUSTNESS_SCORECARD = {
     "technical_score": 0.879229,
     "hit_rate_at_10": 0.92,
     "mrr": 0.850095,
     "mttc": 2.79,
-    "note": "100 catalog products",
+    "note": "archived synthetic run, 100 catalog products",
 }
 
 
@@ -491,10 +491,7 @@ INDEX_HTML = r"""<!doctype html>
             <label for="sessionSelect">Public session</label>
             <select id="sessionSelect"></select>
           </div>
-          <label class="switch" for="qwenToggle">
-            <span>Use local Qwen reranker</span>
-            <input id="qwenToggle" type="checkbox">
-          </label>
+          <input id="qwenToggle" type="checkbox" hidden disabled>
           <div class="actions">
             <button id="startBtn" class="primary" type="button">Start session</button>
             <button id="stepBtn" type="button" disabled>Next turn</button>
@@ -510,7 +507,7 @@ INDEX_HTML = r"""<!doctype html>
             <div class="outcome"><span>Turn</span><strong id="turnMetric">0 / 10</strong></div>
             <div class="outcome"><span>Best rank</span><strong id="rankMetric">-</strong></div>
             <div class="outcome"><span>Hit</span><strong id="hitMetric">no</strong></div>
-            <div class="outcome"><span>Qwen</span><strong id="qwenMetric">off</strong></div>
+            <div class="outcome"><span>LLM calls</span><strong id="qwenMetric">none</strong></div>
           </div>
         </div>
       </section>
@@ -658,12 +655,12 @@ INDEX_HTML = r"""<!doctype html>
         ["Remember", "Update session state", s.state?.summary, "active"],
         ["Search", "Raw, stemmed and dense routes", `${s.raw_bm25?.summary || ""} ${s.stem_bm25?.summary || ""} ${s.dense?.summary || ""}`.trim(), s.dense?.status],
         ["Merge", "Reciprocal rank fusion", s.fusion?.summary, "active"],
-        ["Rerank", "Catalog scoring plus optional Qwen", `${s.rerank?.summary || ""} ${s.qwen?.summary || ""}`.trim(), s.qwen?.status],
+        ["Rerank", "Catalog scoring", `${s.rerank?.summary || ""} ${s.qwen?.summary || ""}`.trim(), s.qwen?.status],
         ["Reply", "Ask and recommend", s.response?.summary, "good"],
       ];
       $("pipeline").innerHTML = data.map(([title, subtitle, text, status], index) => {
         const cls = stageClass(status);
-        const label = status === "accepted" ? "Qwen" : (status === "timeout" || status === "fallback" ? "fallback" : "done");
+        const label = status === "accepted" ? "reranked" : (status === "timeout" || status === "fallback" ? "fallback" : "done");
         return `
           <article class="stage ${cls}">
             <div class="stage-number">${index + 1}</div>
@@ -752,7 +749,7 @@ INDEX_HTML = r"""<!doctype html>
         $("turnMetric").textContent = "0 / 10";
         $("rankMetric").textContent = "-";
         $("hitMetric").textContent = "no";
-        $("qwenMetric").textContent = $("qwenToggle").checked ? "on" : "off";
+        $("qwenMetric").textContent = "none";
         $("targetBadge").textContent = "target hidden";
         $("targetBadge").className = "badge";
         $("candidateHint").textContent = "Top 10 returned to evaluator";
@@ -777,7 +774,7 @@ INDEX_HTML = r"""<!doctype html>
       $("turnMetric").textContent = `${payload.turn || 0} / 10`;
       $("rankMetric").textContent = payload.best_rank || "-";
       $("hitMetric").textContent = payload.hit ? "yes" : "no";
-      $("qwenMetric").textContent = payload.qwen ? "on" : "off";
+      $("qwenMetric").textContent = payload.qwen ? "local" : "none";
       $("targetBadge").textContent = payload.hit ? payload.target : "target hidden";
       $("targetBadge").className = payload.hit ? "badge good" : "badge";
       $("candidateHint").textContent = payload.hit ? `Target found on turn ${payload.first_hit_turn}` : "Top 10 returned to evaluator";
@@ -826,7 +823,7 @@ INDEX_HTML = r"""<!doctype html>
       try {
         const payload = await api("/api/start", {
           sample_id: $("sessionSelect").value,
-          qwen: $("qwenToggle").checked,
+          qwen: false,
         });
         render(payload);
       } catch (error) {
@@ -2960,15 +2957,21 @@ class TraceAgent(Agent):
     def _qwen_command(self) -> list[str] | None:
         if not self.use_qwen:
             return None
-        return super()._qwen_command()
+        command = getattr(super(), "_qwen_command", None)
+        if command is None:
+            return None
+        return command()
 
     def _run_qwen(self, prompt: str) -> str | None:
         command = self._qwen_command()
         trace = self._last_qwen_trace
         trace.update({
             "enabled": self.use_qwen,
-            "model": agent_mod.QWEN_RERANK_MODEL,
-            "timeout": agent_mod._env_float("QWEN_RERANK_TIMEOUT", agent_mod.QWEN_RERANK_TIMEOUT),
+            "model": getattr(agent_mod, "QWEN_RERANK_MODEL", "not configured"),
+            "timeout": getattr(agent_mod, "_env_float", lambda _n, default: default)(
+                "QWEN_RERANK_TIMEOUT",
+                getattr(agent_mod, "QWEN_RERANK_TIMEOUT", 0.0),
+            ),
         })
         if not command:
             trace["status"] = "skipped"
@@ -3015,8 +3018,8 @@ class TraceAgent(Agent):
     def _qwen_rerank(self, state: dict, ranked: list[str], top_k: int) -> list[str]:
         self._last_qwen_trace = {
             "enabled": self.use_qwen,
-            "min_turn": agent_mod.QWEN_MIN_TURN,
-            "pool_size": min(len(ranked), max(top_k, agent_mod.QWEN_RERANK_DEPTH)),
+            "min_turn": getattr(agent_mod, "QWEN_MIN_TURN", 0),
+            "pool_size": min(len(ranked), max(top_k, getattr(agent_mod, "QWEN_RERANK_DEPTH", top_k))),
         }
         if len(ranked) < 2:
             self._last_qwen_trace.update({"status": "skipped", "summary": "Not enough candidates."})
@@ -3024,18 +3027,27 @@ class TraceAgent(Agent):
         if not self.use_qwen:
             self._last_qwen_trace.update({"status": "skipped", "summary": "Qwen toggle is off."})
             return ranked[:top_k]
-        if state.get("turn", 0) < agent_mod.QWEN_MIN_TURN:
+        min_turn = getattr(agent_mod, "QWEN_MIN_TURN", 0)
+        if state.get("turn", 0) < min_turn:
             self._last_qwen_trace.update({
                 "status": "skipped",
-                "summary": f"Skipped until turn {agent_mod.QWEN_MIN_TURN}.",
+                "summary": f"Skipped until turn {min_turn}.",
             })
             return ranked[:top_k]
 
-        pool = ranked[:max(top_k, agent_mod.QWEN_RERANK_DEPTH)]
-        output = self._run_qwen(self._qwen_prompt(state, pool, top_k))
+        pool = ranked[:max(top_k, getattr(agent_mod, "QWEN_RERANK_DEPTH", top_k))]
+        prompt_fn = getattr(self, "_qwen_prompt", None)
+        parse_fn = getattr(self, "_parse_qwen_order", None)
+        if prompt_fn is None or parse_fn is None:
+            self._last_qwen_trace.update({
+                "status": "skipped",
+                "summary": "Qwen reranker is not configured in this branch.",
+            })
+            return ranked[:top_k]
+        output = self._run_qwen(prompt_fn(state, pool, top_k))
         if not output:
             return ranked[:top_k]
-        ordered = self._parse_qwen_order(output, pool)
+        ordered = parse_fn(output, pool)
         if len(ordered) < top_k:
             self._last_qwen_trace.update({
                 "status": "fallback",
@@ -3079,7 +3091,11 @@ class TraceAgent(Agent):
 
         plain = self._query(state["plain"])
         stems = self._query(state["stems"])
-        qwen_gate = self.use_qwen and agent_mod.USE_QWEN_RERANK and turn >= agent_mod.QWEN_MIN_TURN
+        qwen_gate = (
+            self.use_qwen
+            and getattr(agent_mod, "USE_QWEN_RERANK", False)
+            and turn >= getattr(agent_mod, "QWEN_MIN_TURN", 0)
+        )
         key = (tuple(plain), top_k, qwen_gate)
 
         raw_ranking: list[str] = []

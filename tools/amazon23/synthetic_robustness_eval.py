@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import random
 import re
 import statistics
@@ -513,9 +512,7 @@ def normalize_recommendations(payload: object, catalog_ids: set[str], top_k: int
     return result
 
 
-def load_agent_class(use_qwen: bool):
-    if not use_qwen:
-        os.environ["QWEN_RERANK"] = "0"
+def load_agent_class():
     from starter.agent import Agent
 
     return Agent
@@ -652,7 +649,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-k", type=int, default=TOP_K)
     parser.add_argument("--max-turns", type=int, default=MAX_TURNS)
     parser.add_argument("--variants-per-product", type=int, default=1)
-    parser.add_argument("--qwen", action="store_true", help="enable optional local Qwen reranker")
     parser.add_argument("--output", default="", help="optional JSON output path")
     parser.add_argument("--show", type=int, default=0, help="print N generated sessions")
     return parser.parse_args()
@@ -669,7 +665,7 @@ def main() -> None:
             route = ROUTES[(index + variant) % len(ROUTES)]
             routes.append((product, facts, route))
 
-    Agent = load_agent_class(args.qwen)
+    Agent = load_agent_class()
     agent = Agent(catalog_path)
     rows: list[dict] = []
     for index, (_, facts, route) in enumerate(routes, 1):
@@ -703,7 +699,6 @@ def main() -> None:
                 "top_k": args.top_k,
                 "max_turns": args.max_turns,
                 "variants_per_product": args.variants_per_product,
-                "qwen_enabled": bool(args.qwen),
             },
             "overall": overall,
             "by_route": by_route,
