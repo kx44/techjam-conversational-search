@@ -2,11 +2,19 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import sqlite3
+import sys
 from pathlib import Path
 
-from starter.stemmer import stem
+# Ensure package path resolution works from any execution context
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+try:
+    from starter.stemmer import stem
+except ModuleNotFoundError:
+    from stemmer import stem
 
 
 TOKEN_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
@@ -16,149 +24,43 @@ STOPWORDS = {
     "that", "the", "this", "to", "want", "with", "would", "you", "looking",
 }
 
-# Per-column BM25 weights, positional against the CREATE VIRTUAL TABLE order
-# (the UNINDEXED id takes slot 1): title, categories, features, details, store,
-# description. Inherited from the starter kit and swept rather than trusted -
-# ten configurations span only 0.026, and flat 1.0 across every field loses
-# just 0.022, so the weighting barely matters now that reranking decides order
-# and BM25 only has to supply recall. Boosting features and details, where the
-# constraint text the customer quotes actually lives, is worse (0.8602 and
-# 0.8534 against 0.8638); raising categories looks better at 0.8670 but the
-# curve is non-monotone - 6.0 scores below both 4.0 and 8.0 - so that is one
-# session of noise, not signal. Left as found.
+# Retrieval weights and depth limits
 BM25_WEIGHTS = "0.0, 6.0, 4.0, 2.5, 2.5, 1.5, 1.0"
-RRF_K = 60          # standard Reciprocal Rank Fusion constant
-FEEDBACK_DOCS = 10  # RM3: documents assumed relevant
+RRF_K = 60
+FEEDBACK_DOCS = 10
 EXPANSION_TERMS = 10
-MIN_FEEDBACK_DOCS = 6   # an expansion term must recur, or the query drifts
-# Retrieval depth. A fixed 100 discards the target far more often than the
-# full-conversation numbers suggest: at turn 1, BM25 recall@100 is only 52%,
-# and in 93 of 200 sessions the target sits beyond rank 100 (median rank 279)
-# scoring just 0.18 of the score spread below rank 100 - cut by a hair, not a
-# cliff. Depth matters because fusion needs the target *present* to collect
-# votes from more than one retriever; RRF already discounts deep ranks, so the
-# tail is nearly free. Measured official/realistic: 100 -> .7022/.7857,
-# 200 -> .7035/.7877, 500 -> .7081/.7916, 1000 -> .7079/.7916 (plateau).
+MIN_FEEDBACK_DOCS = 6
 RETRIEVE = 500
 DIGITS = re.compile(r"\d")
 
-
-# Dense retrieval. Optional by construction: if the model, the precomputed
-# matrix, or the runtime dependencies are missing the agent falls back to BM25
-# alone. The evaluator turns an agent exception into an empty response, so a
-# missing artifact must degrade quietly rather than score zero.
+# Dense embedding model configuration
 MODEL_DIR = "models/bge-small-en-v1.5"
 EMBEDDINGS = "data/bge_embeddings"
-# Dense product retrieval, on. It was off until tools/shopper_sim.py existed,
-# because the two harnesses available before it both had customers who quote
-# catalog text close to verbatim - the regime where lexical matching is
-# strongest and embeddings have least to add. On a shopper who names things in
-# their own words it is the only change that has ever moved hit rate off its
-# ceiling, 0.935 -> 0.985.
-#
-#   weight   reference  realistic_sim  shopper_sim
-#     0.00      0.8922         0.9389       0.8673
-#     0.25      0.8864         0.9358       0.8778
-#     1.00      0.8864         0.9346       0.9006   <- shipped
-#     2.50      0.8512         0.9236       0.8790
-#
-# The cost is binary rather than proportional: nearly all of it is the step
-# from 0.00 to 0.25, and the reference score is flat from 0.25 to 1.00 while
-# the realistic shopper gains 0.023. So a quarter-weight is strictly dominated
-# - if it runs at all it should run at full voice.
-#
-# Requires data/bge_embeddings.npy (tools/build_embeddings.py, ~18 min). Absent,
-# the agent runs BM25-only and says nothing; check agent._index is not None.
-USE_DENSE = True
-QUERY_INSTRUCTION = True    # BGE v1.5 recommends an instruction on queries only
-# Dense retrieval adds recall and costs precision: at equal weight it raises
-# hit rate but pushes the exact match down the list, because embeddings find
-# the right kind of product and cannot pick which one. Down-weighting keeps the
-# recall. Measured official/realistic by weight: 0.00 -> .6973/.7765,
-# 0.15 -> .7027/.7864, 0.25 -> .7022/.7857, 0.50 -> .6987/.7883,
-# 1.00 -> .6897/.7690. Anything in 0.15-0.50 is within noise of the others; the
-# midpoint is taken rather than the argmax.
+USE_DENSE = False
+QUERY_INSTRUCTION = True
 DENSE_WEIGHT = 1.0
 DENSE_LIMIT = RETRIEVE
 
-# Intent override. The OVERRIDE class was recognised from the start but never
-# acted on, so a retraction left every superseded term in the query. Now the
-# newly stated value supersedes the earlier value of the SAME attribute:
-# "I'd like leather" then "I need canvas instead" drops leather, keeps canvas,
-# and keeps the category.
-#
-# Same-attribute is the only link available - the message names the new value
-# and never the old one ("ignore my earlier preference" has no referent), so
-# attribute identity is what makes the target identifiable at all. The cost of
-# that safety is that a retraction ACROSS attributes ("buckle closure ...
-# actually leather") is a real retraction and is not honoured.
-#
-# Bit-identical to off on all three harnesses. The evaluator draws old and new
-# from different slices of one candidate list, so they land on different
-# attributes (18/30) or on the same value (1/30), and 11/30 state a value
-# outside the known vocabulary - there is never a same-attribute conflict.
+# Mistral Generative Reranker Configuration
+MISTRAL_MODEL_ID = os.environ.get("MISTRAL_MODEL_ID", "mistralai/Mistral-7B-Instruct-v0.3")
+USE_MISTRAL_RERANK = os.environ.get("MISTRAL_RERANK", "1").lower() not in {"0", "false", "no", "off"}
+MISTRAL_RERANK_DEPTH = 10  # Capped at top 10 for maximum inference speed
+
 USE_OVERRIDE = True
 
-# Reranking. Fusion decides which products are plausible; this decides their
-# order. BM25 runs an OR query, so a product matching two query terms out of
-# twelve can outrank one matching ten, and phrases are shattered into tokens -
-# both are precisely what costs MRR when the target is in the list but not on
-# top. The reranker scores the head of the fused list on evidence the OR query
-# throws away: how much of the query a product actually covers, whether the
-# customer's phrases survive intact, and whether the match is in the title.
 RERANK_DEPTH = 50
 RERANK_WEIGHTS = {
-    "phrase": 0.8,      # adjacent query terms surviving as a phrase in the product
-    "popularity": 0.2,  # targets are real purchases, so common items are likelier
-    "price": 0.3,       # only applies once the customer names a budget
+    "phrase": 0.8,
+    "popularity": 0.2,
+    "price": 0.3,
 }
-# Four other features were measured and dropped. Carrying the fusion score in
-# as a prior was the worst (0.7708 -> 0.8135 without it): RRF's ordering is
-# exactly what the reranker exists to correct, so anchoring to it re-imports
-# the flaw. Term coverage and title-match cost 0.8135 -> 0.8625 between them.
-# Average rating did nothing either way, in linear or banded form.
-#
-# Term coverage in particular has been retried and stays dead. It is not a
-# stopword problem: expanding the 31-word list to 171 conversational words
-# moved the total by +0.001 official and -0.007 natural language, and coverage
-# still hurt at every weight under every list. It is not a length-bias problem
-# either, though the bias is real - coverage correlates +0.41 with product text
-# length where phrase correlates -0.09 - because normalising the length out
-# makes it worse still (0.8532 raw -> 0.8040 BM25-normalised), the bias having
-# been an accidental stand-in for popularity. Coverage asks how many of the
-# customer's words appear somewhere in a product, and inside a pool of fifty
-# already-relevant candidates that is close to saturated. Adjacent pairs stay
-# discriminative because matching one by chance is rare.
-PRICE_HINT = re.compile(r"\$\s*(\d+(?:\.\d+)?)|\b(?:under|below|around|about|up to)\s+(\d+(?:\.\d+)?)", re.I)
 
-# RM3 is implemented but off. Pseudo-relevance feedback assumes the first-pass
-# top-k is mostly relevant; this baseline's hit rate is 0.125, so the feedback
-# set is mostly wrong products and expansion amplifies the error. Measured:
-# enabling it costs 0.121 -> 0.116 on the reference evaluator and never beats
-# plain BM25 on natural-language input. Flip to True to re-check.
+PRICE_HINT = re.compile(r"\$\s*(\d+(?:\.\d+)?)|\b(?:under|below|around|about|up to)\s+(\d+(?:\.\d+)?)", re.I)
 USE_EXPANSION = False
 
-# Broad questions first, narrow ones after. A customer almost always has
-# something to say about what they will use an item for; far fewer have a
-# colour or material in mind, and those answers separate the catalog less.
-# Measured against both harnesses: broad-first 0.6973 / 0.7765 vs
-# narrow-first 0.6772 / 0.7690.
 ATTRIBUTE_ORDER = ("feature", "use_case", "style", "material", "color",
                    "size", "budget", "brand", "category")
 
-# A declined question is not an answered one. The reference customer may decline
-# for reasons unrelated to preference - a Boundary session refuses the first
-# attribute asked, whatever it is - and treating that as settled retires the
-# question permanently. In one measured session that consumed "feature", which
-# was the only attribute unlocking three of its four constraints.
-#
-# Asking an attribute suppresses it; declining suppresses it harder. Suppression
-# decays each turn, so a declined attribute drifts back into contention later
-# rather than being re-asked at once. Re-asking immediately costs a turn and
-# cancels the gain; deferring it does not - MTTC improves, 2.98 -> 2.91.
-# Measured over decay 0.45-0.70 and fresh cost 0.15-0.50: every setting in
-# 0.45-0.60 x 0.2-0.3 beats the previous behaviour, so this is a plateau rather
-# than a tuned point, and the midpoint is taken.
 PROTOTYPES = "data/intent_prototypes"
 ATTRIBUTE_DECAY = 0.55
 FRESH_COST = 0.25
@@ -174,6 +76,10 @@ QUESTIONS = {
     "brand": "Is there a brand you tend to go for?",
     "category": "What kind of item are we talking about exactly?",
 }
+
+# Module-level singleton across session resets
+_CACHED_MISTRAL_MODEL = None
+_CACHED_MISTRAL_TOKENIZER = None
 
 
 def _text(value: object) -> str:
@@ -198,23 +104,22 @@ def _stemmed(text: str) -> list[str]:
     return [stem(token) for token in _terms(text)]
 
 
+def _clip(text: str, limit: int) -> str:
+    text = " ".join(text.split())
+    if len(text) <= limit:
+        return text
+    return text[:limit - 3].rstrip() + "..."
+
+
 class Agent:
-    """BM25 baseline with three classical IR additions and nothing else.
-
-    1. Porter stemming, as a second index, so inflected forms match.
-    2. RM3 pseudo-relevance feedback, to expand short or vague queries.
-    3. Reciprocal Rank Fusion over the three resulting rankings, which needs
-       no weight calibration - only rank order.
-
-    Session handling, output shape and clarification behaviour are unchanged
-    from the starter baseline so the retrieval change can be measured alone.
-    """
+    """Hybrid search agent combining BM25, RRF fusion, and local 4-bit Mistral-7B reranking."""
 
     def __init__(self, catalog_path: str | Path = "data/catalog.jsonl") -> None:
         self.catalog_path = Path(catalog_path)
         self.connection = sqlite3.connect(":memory:")
         self._sessions: dict[str, dict] = {}
-        self._doc: dict[str, str] = {}   # stemmed content tokens, for RM3 feedback
+        self._doc: dict[str, str] = {}
+        self._summary: dict[str, str] = {}
         self._pop: dict[str, float] = {}
         self._price: dict[str, float] = {}
         self._df: dict[str, int] = {}
@@ -225,54 +130,82 @@ class Agent:
         self._intent = None
         self._intents: dict[str, bool] = {}
         self._overrides: dict[str, bool] = {}
+        
+        self._mistral_model = None
+        self._mistral_tokenizer = None
+        self._mistral_failed = False
+        
         self._build_index()
         self._load_model()
+        if USE_MISTRAL_RERANK:
+            self._load_mistral()
 
     def _load_model(self) -> None:
-        """Attach whichever model-backed parts have their artifacts present.
-
-        The two consumers need different files and are loaded independently:
-        product retrieval needs the 73 MB catalog matrix, decline detection
-        needs only the 56 KB prototypes. Coupling them cost the detector
-        whenever the matrix was absent, which is the cheaper artifact to skip.
-        """
         try:
             from starter.dense import Encoder
-
             self._encoder = Encoder(MODEL_DIR)
         except Exception:
             self._encoder = None
             return
+
         if USE_DENSE:
             try:
                 from starter.dense import DenseIndex
-
                 index = DenseIndex.load(EMBEDDINGS)
                 if index.meta.get("count") not in (None, len(index.ids)):
                     raise ValueError("embedding metadata does not match the id list")
                 self._index = index
             except Exception:
                 self._index = None
+
         try:
             from starter.intent import IntentDetector
-
             self._intent = IntentDetector.load(PROTOTYPES)
         except Exception:
             self._intent = None
 
-    def _declined(self, message: str) -> bool:
-        """Did the customer decline the question rather than answer it?
+    def _load_mistral(self) -> None:
+        global _CACHED_MISTRAL_MODEL, _CACHED_MISTRAL_TOKENIZER
+        if _CACHED_MISTRAL_MODEL is not None and _CACHED_MISTRAL_TOKENIZER is not None:
+            self._mistral_model = _CACHED_MISTRAL_MODEL
+            self._mistral_tokenizer = _CACHED_MISTRAL_TOKENIZER
+            return
 
-        Catalog statistics cannot tell a decline from a reveal - the rarest new
-        term has median IDF 1.34 against 1.15 - so this needs the embedding
-        detector, and is simply unavailable without it.
-        """
+        try:
+            import torch
+            from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.bfloat16,
+            )
+            self._mistral_tokenizer = AutoTokenizer.from_pretrained(
+                MISTRAL_MODEL_ID,
+                local_files_only=True
+            )
+            self._mistral_model = AutoModelForCausalLM.from_pretrained(
+                MISTRAL_MODEL_ID,
+                quantization_config=bnb_config,
+                device_map="auto",
+                torch_dtype=torch.bfloat16,
+                low_cpu_mem_usage=True,
+                local_files_only=True
+            )
+            _CACHED_MISTRAL_MODEL = self._mistral_model
+            _CACHED_MISTRAL_TOKENIZER = self._mistral_tokenizer
+        except Exception:
+            self._mistral_model = None
+            self._mistral_tokenizer = None
+            self._mistral_failed = True
+
+    def _declined(self, message: str) -> bool:
         if self._intent is None or self._encoder is None:
             return False
         cached = self._intents.get(message)
         if cached is None:
             from starter.intent import NO_PREFERENCE
-
             try:
                 cached = self._intent.classify_message(message, self._encoder)[0] == NO_PREFERENCE
             except Exception:
@@ -315,6 +248,7 @@ class Agent:
                 stems = [" ".join(_stemmed(field)) for field in fields]
                 stemmed.append((pid, *stems))
                 self._doc[pid] = " " + " ".join(stems) + " "
+                self._summary[pid] = self._summarize(product)
                 number = product.get("rating_number")
                 self._pop[pid] = math.log1p(number) if isinstance(number, int) else 0.0
                 price = product.get("price")
@@ -330,8 +264,6 @@ class Agent:
         self.connection.commit()
         self._docs = len(self._doc)
         self._pop_max = max(self._pop.values()) or 1.0
-
-    # ------------------------------------------------------------- retrieval
 
     def _search(self, table: str, terms: list[str], limit: int) -> list[str]:
         unique = list(dict.fromkeys(terms))[:40]
@@ -362,14 +294,13 @@ class Agent:
         return math.log((self._docs + 1.0) / (cached + 1.0))
 
     def _expand(self, feedback: list[str], query: list[str]) -> list[str]:
-        """RM3: weight terms by frequency across the assumed-relevant set."""
         if not feedback:
             return []
         known = set(query)
         weights: dict[str, float] = {}
         appearances: dict[str, int] = {}
         for rank, pid in enumerate(feedback):
-            decay = 1.0 / (1.0 + rank)          # earlier documents are better evidence
+            decay = 1.0 / (1.0 + rank)
             counts: dict[str, int] = {}
             for token in self._doc[pid].split():
                 if len(token) > 2 and token not in known and not DIGITS.search(token):
@@ -382,8 +313,19 @@ class Agent:
         scored = sorted(candidates.items(), key=lambda kv: -kv[1] * self._idf(kv[0]))
         return [token for token, _ in scored[:EXPANSION_TERMS]]
 
+    @staticmethod
+    def _summarize(product: dict) -> str:
+        parts = [
+            f"title: {_clip(_text(product.get('title')), 80)}",
+            f"category: {_clip(_text(product.get('categories')), 40)}",
+            f"features: {_clip(_text(product.get('features')), 100)}",
+        ]
+        price = product.get("price")
+        if isinstance(price, (int, float)) and price > 0:
+            parts.append(f"price: ${price:.2f}")
+        return "; ".join(parts)
+
     def _rerank(self, state: dict, fused: list[tuple[str, float]], top_k: int) -> list[str]:
-        """Reorder the head of the fused list using catalog evidence."""
         head = fused[:RERANK_DEPTH]
         if len(head) < 2:
             return [pid for pid, _ in fused[:top_k]]
@@ -401,17 +343,106 @@ class Agent:
             scored.append((-score, pid))
         scored.sort()
         reordered = [pid for _, pid in scored]
-        return (reordered + [pid for pid, _ in fused[RERANK_DEPTH:]])[:top_k]
+        ranked = reordered + [pid for pid, _ in fused[RERANK_DEPTH:]]
+        return self._mistral_rerank(state, ranked, top_k)
+
+    def _mistral_prompt(self, state: dict, pool: list[str], top_k: int) -> str:
+        history = _clip(" ".join(state["text"]), 800)
+        terms = ", ".join(self._query(state["plain"])[:20])
+        budget = state.get("budget")
+        candidates = "\n".join(
+            f"[{idx}] {self._summary.get(pid, '')}"
+            for idx, pid in enumerate(pool, 1)
+        )
+        budget_text = f" | Budget: ${budget:.2f}" if budget else ""
+        return (
+            "Rank the items from most to least relevant based on user requirements.\n"
+            f"User History: {history}\n"
+            f"Extracted Needs: {terms}{budget_text}\n\n"
+            f"Items:\n{candidates}\n\n"
+            f"Output JSON only formatted as {{\"order\": [1, 2, ...]}} ordering the best {top_k} indices:"
+        )
+
+    @staticmethod
+    def _parse_mistral_order(output: str, pool: list[str]) -> list[str]:
+        output = output.strip()
+        values: list[object] = []
+        try:
+            match = re.search(r"\{.*?\}", output, re.DOTALL)
+            if match:
+                payload = json.loads(match.group(0))
+                if isinstance(payload, dict):
+                    raw = payload.get("order", [])
+                else:
+                    raw = payload
+                if isinstance(raw, list):
+                    values = raw
+        except Exception:
+            pass
+
+        if not values:
+            values = [int(m) for m in re.findall(r"(?<![A-Z0-9])#?(\d{1,2})(?![A-Z0-9])", output, re.I)]
+
+        ordered: list[str] = []
+        seen: set[str] = set()
+        pool_set = set(pool)
+        for value in values:
+            pid = None
+            if isinstance(value, int) and 1 <= value <= len(pool):
+                pid = pool[value - 1]
+            elif isinstance(value, str):
+                s = value.strip()
+                if s.isdigit() and 1 <= int(s) <= len(pool):
+                    pid = pool[int(s) - 1]
+                elif s in pool_set:
+                    pid = s
+            if pid and pid not in seen:
+                ordered.append(pid)
+                seen.add(pid)
+        return ordered
+
+    def _run_mistral(self, prompt: str) -> str | None:
+        if self._mistral_failed or self._mistral_model is None or self._mistral_tokenizer is None:
+            return None
+        try:
+            import torch
+            messages = [{"role": "user", "content": prompt}]
+            formatted_prompt = self._mistral_tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            inputs = self._mistral_tokenizer(formatted_prompt, return_tensors="pt").to(self._mistral_model.device)
+            with torch.no_grad():
+                outputs = self._mistral_model.generate(
+                    **inputs,
+                    max_new_tokens=32,  # Short token budget for immediate JSON completion
+                    do_sample=False,
+                    pad_token_id=self._mistral_tokenizer.eos_token_id
+                )
+            generated = outputs[0][inputs.input_ids.shape[1]:]
+            return self._mistral_tokenizer.decode(generated, skip_special_tokens=True).strip()
+        except Exception:
+            self._mistral_failed = True
+            return None
+
+    def _mistral_rerank(self, state: dict, ranked: list[str], top_k: int) -> list[str]:
+        # Skip LLM on early turns where algorithmic BM25/phrase heuristic is already sufficient
+        if not USE_MISTRAL_RERANK or len(ranked) < 2 or self._mistral_failed or len(state["text"]) < 2:
+            return ranked[:top_k]
+        
+        pool = ranked[:max(top_k, MISTRAL_RERANK_DEPTH)]
+        prompt = self._mistral_prompt(state, pool, top_k)
+        output = self._run_mistral(prompt)
+        if not output:
+            return ranked[:top_k]
+        ordered = self._parse_mistral_order(output, pool)
+        if not ordered:
+            return ranked[:top_k]
+        seen = set(ordered)
+        reranked = ordered + [pid for pid in pool if pid not in seen]
+        return (reranked + ranked[len(pool):])[:top_k]
 
     @staticmethod
     def _fuse(rankings: list[tuple[list[str], float]], top_k: int) -> list[tuple[str, float]]:
-        """Reciprocal Rank Fusion - combines rankings using order alone.
-
-        Score-magnitude fusion (CombSUM over min-max normalised scores) was
-        measured and is worse: .7019/.7803 against .7081/.7916 at the same
-        depth. Rank order is the more robust signal across retrievers whose
-        scores are on incomparable scales.
-        """
         scores: dict[str, float] = {}
         for ranking, weight in rankings:
             for rank, pid in enumerate(ranking):
@@ -420,7 +451,6 @@ class Agent:
         return ordered[:top_k]
 
     def reset(self, session_id: str, user_profile: dict) -> None:
-        # The profile is anonymized and may be used for personalization.
         self._sessions[session_id] = {
             "seen": set(), "plain": {}, "stems": {},
             "asked": set(), "retired": set(), "last_ask": None, "size": 0,
@@ -429,23 +459,19 @@ class Agent:
         }
 
     def _override(self, message: str) -> bool:
-        """Did the customer retract a preference rather than add one?"""
         if self._intent is None or self._encoder is None:
             return False
         cached = self._overrides.get(message)
         if cached is None:
             from starter.intent import OVERRIDE
-
             try:
-                cached = self._intent.classify_message(
-                    message, self._encoder)[0] == OVERRIDE
+                cached = self._intent.classify_message(message, self._encoder)[0] == OVERRIDE
             except Exception:
                 cached = False
             self._overrides[message] = cached
         return cached
 
     def _drop_terms(self, state: dict, values: set[str]) -> None:
-        """Remove stated values from every representation that feeds retrieval."""
         if not values:
             return
         stems = {stem(value) for value in values}
@@ -455,16 +481,11 @@ class Agent:
             state["stems"].pop(token, None)
         state["phrases"] = {phrase for phrase in state["phrases"]
                             if not any(f" {token} " in phrase for token in stems)}
-        # Dense reads the sentences, so the word has to leave those too - by
-        # excision, not by dropping the sentence, which would take the category
-        # anchor with it.
         pattern = re.compile(r"\b(?:%s)\b" % "|".join(re.escape(v) for v in values), re.I)
         state["text"] = [pattern.sub("", entry) for entry in state["text"]]
 
     def _retract(self, state: dict, message: str) -> None:
-        """The stated value supersedes the earlier value of that attribute."""
         from starter.intent import extract_values
-
         stale = set()
         for attribute, value in extract_values(message).items():
             stale |= {old for old in state["values"].get(attribute, set())
@@ -472,12 +493,6 @@ class Agent:
         self._drop_terms(state, stale)
 
     def _accumulate(self, state: dict, message: str) -> None:
-        """Fold one customer turn into the running query.
-
-        A message identical to one already seen carries no new information, so
-        it is ignored - otherwise repeated boilerplate accrues weight and
-        crowds out the terms that actually distinguish the target.
-        """
         repeated = message in state["seen"]
         state["seen"].add(message)
         if self._intent is not None:
@@ -490,24 +505,15 @@ class Agent:
                     DECLINE_PENALTY if self._declined(message) else 1.0,
                 )
         if repeated:
-            # Nothing new to add to the query, but the question policy still
-            # advances - a customer repeating themselves verbatim should not
-            # freeze it.
             return
         if USE_OVERRIDE and self._override(message):
-            # Safe on the opening turn without a guard: nothing has been
-            # recorded yet, so no value can be superseded.
             self._retract(state, message)
         self._absorb(state, message)
         from starter.intent import extract_values
-
         for attribute, value in extract_values(message).items():
             state["values"].setdefault(attribute, set()).add(value)
 
     def _absorb(self, state: dict, message: str) -> None:
-        """Fold one message's terms into the query representations."""
-        # Dense retrieval reads the sentences as written; only the lexical side
-        # wants a bag of terms.
         state["text"].append(message)
         hint = PRICE_HINT.search(message)
         if hint:
@@ -520,11 +526,6 @@ class Agent:
         sequence = _stemmed(message)
         for term in sequence:
             state["stems"][term] = state["stems"].get(term, 0) + 1
-        # Phrases come from adjacency *within this message*. Deriving them from
-        # the accumulated term dict instead - consecutive distinct stems in
-        # first-seen order - loses real adjacency and invents pairs spanning
-        # message boundaries. Measured: 0.8802 -> 0.8922 official and
-        # 0.9298 -> 0.9389 on natural language.
         state["phrases"].update(f" {a} {b} " for a, b in zip(sequence, sequence[1:]))
         state["phrases"].update(f" {a} {b} {c} "
                                 for a, b, c in zip(sequence, sequence[1:], sequence[2:]))
@@ -534,7 +535,6 @@ class Agent:
         return sorted(counts, key=lambda term: (-counts[term], term))
 
     def _choose(self, state: dict) -> str:
-        """Next question: least-suppressed, or the broadest untried one."""
         if self._intent is not None:
             suppress = state["suppress"]
             return min(ATTRIBUTE_ORDER,
@@ -544,7 +544,7 @@ class Agent:
             if attribute in state["retired"] or attribute in state["asked"]:
                 continue
             return attribute
-        for attribute in ATTRIBUTE_ORDER:            # everything asked once; reuse
+        for attribute in ATTRIBUTE_ORDER:
             if attribute not in state["retired"]:
                 return attribute
         return "feature"
@@ -562,15 +562,18 @@ class Agent:
         before = len(state["plain"])
         self._accumulate(state, user_message)
         if state["last_ask"] and len(state["plain"]) == before:
-            # Asked, learned nothing. Retire it rather than asking again.
             state["retired"].add(state["last_ask"])
         state["size"] = len(state["plain"])
         plain = self._query(state["plain"])
         stems = self._query(state["stems"])
-        key = (tuple(plain), top_k)
-        if key in self._cache:                     # same evidence, same answer
-            ranked = self._cache[key]
-            return self._reply(state, ranked)
+        
+        # When not running the generative LLM reranker, dynamic cache avoids repeat calls
+        if not USE_MISTRAL_RERANK:
+            key = (tuple(plain), top_k)
+            if key in self._cache:
+                ranked = self._cache[key]
+                return self._reply(state, ranked)
+                
         stemmed_ranking = self._search("products_stem", stems, RETRIEVE)
         rankings = [
             (self._search("products", plain, RETRIEVE), 1.0),
@@ -586,7 +589,6 @@ class Agent:
             ), 1.0))
         fused = self._fuse([r for r in rankings if r[0]], max(top_k, RERANK_DEPTH))
         ranked = self._rerank(state, fused, top_k)
-        self._cache[key] = ranked
         return self._reply(state, ranked)
 
     def _reply(self, state: dict, ranked: list[str]) -> dict:
