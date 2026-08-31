@@ -117,6 +117,11 @@ CLAUSE_PROTOTYPES: dict[str, tuple[str, ...]] = {
         'Clause: "No [VALUE] please."\nPair: material=[VALUE]\nDoes the user want this value? no, the user does not want this value.',
         'Clause: "Avoid [VALUE]."\nPair: color=[VALUE]\nDoes the user want this value? no, the user wants to avoid this value.',
         'Clause: "Anything but [VALUE]."\nPair: color=[VALUE]\nDoes the user want this value? no, any value except this one.',
+        'Clause: "Definitely not [VALUE]."\nPair: color=[VALUE]\nDoes the user want this value? no, this value is strongly rejected.',
+        'Clause: "Not [VALUE] lah."\nPair: color=[VALUE]\nDoes the user want this value? no, the user rejects this value.',
+        'Clause: "I would prefer something other than [VALUE]."\nPair: material=[VALUE]\nDoes the user want this value? no, the user wants something else.',
+        'Clause: "Not too keen on [VALUE]."\nPair: material=[VALUE]\nDoes the user want this value? no, this value is not preferred.',
+        'Clause: "[VALUE] is a dealbreaker."\nPair: material=[VALUE]\nDoes the user want this value? no, this value is unacceptable.',
         'Clause: "I am not looking for [VALUE]."\nPair: material=[VALUE]\nDoes the user want this value? no, this value is rejected.',
         'Clause: "Without [VALUE]."\nPair: material=[VALUE]\nDoes the user want this value? no, this value should be excluded.',
         'Clause: "I dislike [VALUE]."\nPair: color=[VALUE]\nDoes the user want this value? no, the user dislikes this value.',
@@ -138,7 +143,9 @@ CLAUSE_CLASSES = (ACCEPT, REJECT, NEUTRAL)
 CLAUSE_MIN_SIMILARITY = 0.50
 CLAUSE_MIN_MARGIN = 0.025
 CLAUSE_SPLIT = re.compile(
-    r"(?<=[.!?;])\s+|\s+--\s+|\s*,?\s+\b(?:but|however|though|although|except)\b\s+",
+    r"(?<=[.!?;])\s+|\s+--\s+"
+    r"|\s*,\s+(?=(?:definitely|defintely|not|no|avoid|without|never|dont|don't|cant|can't|cannot|skip)\b)"
+    r"|\s*,?\s+\b(?<!anything\s)(?:but|however|though|although|except)\b\s+",
     re.I,
 )
 

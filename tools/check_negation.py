@@ -48,8 +48,8 @@ def main() -> None:
         rejected_attr, rejected_value = rejected
         if accepted_value not in state["plain"]:
             failures.append(f"{message!r}: missing accepted term {accepted_value!r}")
-        if accepted_value not in state["accepted"].get(accepted_attr, set()):
-            failures.append(f"{message!r}: missing accepted pair {accepted_attr}={accepted_value}")
+        if accepted_value not in state["values"].get(accepted_attr, set()):
+            failures.append(f"{message!r}: missing stated pair {accepted_attr}={accepted_value}")
         if rejected_value not in state["rejected"].get(rejected_attr, set()):
             failures.append(f"{message!r}: missing rejected pair {rejected_attr}={rejected_value}")
         if rejected_value in state["plain"]:
@@ -71,8 +71,6 @@ def main() -> None:
     agent._accumulate(state, "Actually, leather isn't for me.")
     if "leather" not in state["rejected"].get("material", set()):
         failures.append("change-of-mind: leather was not marked rejected")
-    if "leather" in state["accepted"].get("material", set()):
-        failures.append("change-of-mind: leather stayed accepted after rejection")
     if "leather" in state["plain"]:
         failures.append("change-of-mind: leather stayed in positive plain query")
 
@@ -92,6 +90,22 @@ def main() -> None:
     agent._accumulate(state, "Wrap closure.")
     if "wrap" not in state["plain"] or "closure" not in state["plain"]:
         failures.append("unpaired reject: useful clause text was dropped")
+
+    agent.reset("singlish", {})
+    state = agent._sessions["singlish"]
+    agent._accumulate(state, "red clothes for cny, defintely not black lah ofc")
+    if "black" not in state["rejected"].get("color", set()):
+        failures.append("singlish inline negation: black was not rejected")
+    if "black" in state["plain"]:
+        failures.append("singlish inline negation: black leaked into plain query")
+    if "red" not in state["plain"]:
+        failures.append("singlish inline negation: red was not kept positive")
+
+    agent.reset("anything-but", {})
+    state = agent._sessions["anything-but"]
+    agent._accumulate(state, "anything but leather")
+    if "leather" not in state["rejected"].get("material", set()):
+        failures.append("anything but: leather was not rejected")
 
     agent.reset("neutral", {})
     state = agent._sessions["neutral"]

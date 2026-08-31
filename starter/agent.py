@@ -79,6 +79,9 @@ QUERY_INSTRUCTION = True    # BGE v1.5 recommends an instruction on queries only
 # 1.00 -> .6897/.7690. Anything in 0.15-0.50 is within noise of the others; the
 # midpoint is taken rather than the argmax.
 DENSE_WEIGHT = 1.0
+DENSE_LEXICAL_WEIGHT = 0.15
+DENSE_PARAPHRASE_WEIGHT = 1.0
+DENSE_LEXICAL_OVERLAP = 0.25
 DENSE_LIMIT = RETRIEVE
 PREFERENCE_TERM_BOOST = 2
 PREFERENCE_DENSE_BOOST = 2
@@ -116,12 +119,16 @@ USE_OVERRIDE = True
 # top. The reranker scores the head of the fused list on evidence the OR query
 # throws away: how much of the query a product actually covers, whether the
 # customer's phrases survive intact, and whether the match is in the title.
-RERANK_DEPTH = 50
+RERANK_DEPTH = 100
 RERANK_WEIGHTS = {
     "phrase": 0.8,      # adjacent query terms surviving as a phrase in the product
     "popularity": 0.2,  # targets are real purchases, so common items are likelier
     "price": 0.3,       # only applies once the customer names a budget
 }
+SEMANTIC_RESCUE_INSERT = 5      # zero-based; rescue to visible rank 6
+SEMANTIC_RESCUE_FUSED_MAX = 2   # zero-based; fused top 3 only
+SEMANTIC_RESCUE_LEXICAL_MAX = 2 # zero-based; raw+stem top 3 only
+SEMANTIC_RESCUE_DENSE_MAX = 4   # zero-based; dense top 5 only
 # Four other features were measured and dropped. Carrying the fusion score in
 # as a prior was the worst (0.7708 -> 0.8135 without it): RRF's ordering is
 # exactly what the reranker exists to correct, so anchoring to it re-imports
@@ -155,6 +162,18 @@ USE_EXPANSION = False
 # narrow-first 0.6772 / 0.7690.
 ATTRIBUTE_ORDER = ("feature", "use_case", "style", "material", "color",
                    "size", "budget", "brand", "category")
+EXPLORE_ORDER = ATTRIBUTE_ORDER
+CONSTRAIN_ORDER = ("material", "color", "size", "budget", "feature",
+                   "use_case", "style", "brand", "category")
+VERIFY_ORDER = ("material", "color", "size", "budget", "style", "feature",
+                "use_case", "brand", "category")
+FLAT_ORDER = ("feature", "style", "material", "color", "use_case", "size",
+              "budget", "brand", "category")
+OVERGENERAL_TERMS = 4
+LOW_ROUTE_OVERLAP = 0.12
+TOP_OVERLAP = 20
+FLAT_POOL_SPREAD = 0.27
+FLAT_POOL_VARIANCE = 0.000007
 
 # A declined question is not an answered one. The reference customer may decline
 # for reasons unrelated to preference - a Boundary session refuses the first
@@ -439,6 +458,21 @@ class Agent:
             scored.append((-score, pid))
         scored.sort()
         reordered = [pid for _, pid in scored]
+        route_ranks = state.get("route_ranks", {})
+        fused_ranks = {pid: rank for rank, (pid, _) in enumerate(head)}
+        rescues: list[tuple[int, str]] = []
+        for pid in reordered[top_k:]:
+            ranks = route_ranks.get(pid, {})
+            if (
+                fused_ranks.get(pid, RERANK_DEPTH) <= SEMANTIC_RESCUE_FUSED_MAX
+                and ranks.get("raw", RERANK_DEPTH) <= SEMANTIC_RESCUE_LEXICAL_MAX
+                and ranks.get("stem", RERANK_DEPTH) <= SEMANTIC_RESCUE_LEXICAL_MAX
+                and ranks.get("dense", RERANK_DEPTH) <= SEMANTIC_RESCUE_DENSE_MAX
+            ):
+                rescues.append((fused_ranks[pid], pid))
+        for _, pid in reversed(sorted(rescues)):
+            reordered.remove(pid)
+            reordered.insert(min(SEMANTIC_RESCUE_INSERT, top_k - 1, len(reordered)), pid)
         return (reordered + [pid for pid, _ in fused[RERANK_DEPTH:]])[:top_k]
 
     @staticmethod
@@ -470,6 +504,7 @@ class Agent:
             #               supersede when a new value arrives for an attribute
             "positive_clauses": [], "rejected": {}, "preferences": {},
             "values": {}, "superseded": {},
+            "diagnostics": {}, "mode": "explore",
         }
 
     def _override(self, message: str) -> bool:
@@ -654,18 +689,111 @@ class Agent:
     def _query(counts: dict[str, int]) -> list[str]:
         return sorted(counts, key=lambda term: (-counts[term], term))
 
+    @staticmethod
+    def _overlap(left: list[str], right: list[str], depth: int = TOP_OVERLAP) -> float:
+        a = set(left[:depth])
+        b = set(right[:depth])
+        if not a or not b:
+            return 0.0
+        return len(a & b) / len(a | b)
+
+    def _dense_weight(self, state: dict, raw_ranking: list[str], stemmed_ranking: list[str]) -> float:
+        """Let dense help paraphrases, but keep lexical agreement in charge."""
+        if len(state["plain"]) < OVERGENERAL_TERMS:
+            return DENSE_PARAPHRASE_WEIGHT
+        lexical_overlap = self._overlap(raw_ranking, stemmed_ranking)
+        if lexical_overlap >= DENSE_LEXICAL_OVERLAP:
+            return DENSE_LEXICAL_WEIGHT
+        return DENSE_PARAPHRASE_WEIGHT
+
+    def _diagnose(self, state: dict, rankings: list[tuple[list[str], float]],
+                  fused: list[tuple[str, float]]) -> dict:
+        """Cheap uncertainty signals for question policy, not ranking."""
+        active = [ranking for ranking, _ in rankings if ranking]
+        overlaps = []
+        for index, left in enumerate(active):
+            for right in active[index + 1:]:
+                overlaps.append(self._overlap(left, right))
+        route_overlap = sum(overlaps) / len(overlaps) if overlaps else 0.0
+        fused_scores = [score for _, score in fused[:TOP_OVERLAP]]
+        if len(fused_scores) > 1 and fused_scores[0] > 0:
+            score_spread = (fused_scores[0] - fused_scores[-1]) / fused_scores[0]
+            mean = sum(fused_scores) / len(fused_scores)
+            score_variance = sum((score - mean) ** 2 for score in fused_scores) / len(fused_scores)
+        else:
+            score_spread = 1.0
+            score_variance = 0.0
+        flat_pool = (
+            score_spread < FLAT_POOL_SPREAD
+            or score_variance < FLAT_POOL_VARIANCE
+        )
+        preference_count = sum(
+            1 for signal in state["preferences"].values()
+            if getattr(signal, "weight", 0.0) > 0
+        )
+        rejected_count = sum(len(values) for values in state["rejected"].values())
+        superseded_count = sum(len(values) for values in state["superseded"].values())
+        query_terms = len(state["plain"])
+        over_general = (
+            query_terms < OVERGENERAL_TERMS
+            or (preference_count == 0 and route_overlap < LOW_ROUTE_OVERLAP)
+        )
+        needs_constraints = (
+            not over_general
+            and preference_count < 2
+            and len(state["asked"]) >= 2
+        )
+        if rejected_count or superseded_count:
+            mode = "verify"
+        elif over_general:
+            mode = "explore"
+        elif flat_pool and (needs_constraints or len(state["asked"]) >= 1):
+            mode = "flat"
+        elif needs_constraints:
+            mode = "constrain"
+        else:
+            mode = "normal"
+        return {
+            "query_terms": query_terms,
+            "route_overlap": round(route_overlap, 4),
+            "score_spread": round(score_spread, 6),
+            "score_variance": round(score_variance, 9),
+            "flat_pool": flat_pool,
+            "dense_weight": state.get("dense_weight", DENSE_WEIGHT),
+            "candidate_count": len(fused),
+            "preference_count": preference_count,
+            "rejected_count": rejected_count,
+            "superseded_count": superseded_count,
+            "over_general": over_general,
+            "needs_constraints": needs_constraints,
+            "mode": mode,
+        }
+
     def _choose(self, state: dict) -> str:
         """Next question: least-suppressed, or the broadest untried one."""
+        mode = state.get("mode", "normal")
+        order = {
+            "explore": EXPLORE_ORDER,
+            "constrain": CONSTRAIN_ORDER,
+            "verify": VERIFY_ORDER,
+            "flat": FLAT_ORDER,
+        }.get(mode, ATTRIBUTE_ORDER)
+        if mode == "verify":
+            front = tuple(
+                attribute for attribute in VERIFY_ORDER
+                if attribute in state["rejected"] or attribute in state["superseded"]
+            )
+            order = front + tuple(attribute for attribute in order if attribute not in front)
         if self._intent is not None:
             suppress = state["suppress"]
-            return min(ATTRIBUTE_ORDER,
+            return min(order,
                        key=lambda a: (suppress[a] if a in suppress else FRESH_COST,
-                                      ATTRIBUTE_ORDER.index(a)))
-        for attribute in ATTRIBUTE_ORDER:
+                                      order.index(a)))
+        for attribute in order:
             if attribute in state["retired"] or attribute in state["asked"]:
                 continue
             return attribute
-        for attribute in ATTRIBUTE_ORDER:            # everything asked once; reuse
+        for attribute in order:                       # everything asked once; reuse
             if attribute not in state["retired"]:
                 return attribute
         return "feature"
@@ -693,19 +821,32 @@ class Agent:
             ranked = self._cache[key]
             return self._reply(state, ranked)
         stemmed_ranking = self._search("products_stem", stems, RETRIEVE)
+        raw_ranking = self._search("products", plain, RETRIEVE)
+        dense_ranking = self._dense_ranking(" ".join(state["text"]), DENSE_LIMIT) if USE_DENSE else []
+        dense_weight = self._dense_weight(state, raw_ranking, stemmed_ranking) if dense_ranking else 0.0
+        state["dense_weight"] = dense_weight
         rankings = [
-            (self._search("products", plain, RETRIEVE), 1.0),
+            (raw_ranking, 1.0),
             (stemmed_ranking, 1.0),
-            (self._dense_ranking(" ".join(state["text"]), DENSE_LIMIT) if USE_DENSE else [],
-             DENSE_WEIGHT),
+            (dense_ranking, dense_weight),
         ]
         if USE_EXPANSION:
-            rankings.append((self._search(
+            expansion_ranking = self._search(
                 "products_stem",
                 stems + self._expand(stemmed_ranking[:FEEDBACK_DOCS], stems),
                 RETRIEVE,
-            ), 1.0))
+            )
+            rankings.append((expansion_ranking, 1.0))
+        route_ranks: dict[str, dict[str, int]] = {}
+        for name, ranking in (("raw", raw_ranking), ("stem", stemmed_ranking),
+                              ("dense", dense_ranking)):
+            for rank, pid in enumerate(ranking[:RERANK_DEPTH]):
+                route_ranks.setdefault(pid, {})[name] = rank
+        state["route_ranks"] = route_ranks
         fused = self._fuse([r for r in rankings if r[0]], max(top_k, RERANK_DEPTH))
+        diagnostics = self._diagnose(state, rankings, fused)
+        state["diagnostics"] = diagnostics
+        state["mode"] = diagnostics["mode"]
         ranked = self._rerank(state, fused, top_k)
         self._cache[key] = ranked
         return self._reply(state, ranked)
